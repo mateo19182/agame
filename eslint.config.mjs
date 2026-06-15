@@ -16,6 +16,7 @@ const eslintConfig = defineConfig([
     ".open-next/**",
     "party/**",
     "worker-configuration.d.ts",
+    ".agents/**",
   ]),
 ]);
 

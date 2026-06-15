@@ -88,6 +88,7 @@ export type GameState = {
 export type ClientMessage =
   | { type: "host-join"; name: string }
   | { type: "player-join"; name: string }
+  | { type: "rejoin"; playerId: string }
   | { type: "start-game"; settings?: GameSettings; photos?: PhotoEntry[] }
   | { type: "next-question" }
   | { type: "buzz" }

@@ -4,7 +4,7 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import type { ClientMessage, GameState, ServerMessage } from "./game";
 
 function resolveHost(): string {
-  const envHost = process.env.NEXT_PUBLIC_PARTYKIT_HOST;
+  const envHost = process.env.NEXT_PUBLIC_REALTIME_HOST;
   if (envHost) return envHost;
   if (typeof window !== "undefined" && window.location.hostname === "localhost") {
     return "localhost:1999";
@@ -16,6 +16,8 @@ function wsUrl(roomId: string): string {
   const protocol = typeof window !== "undefined" && window.location.protocol === "https:" ? "wss" : "ws";
   return `${protocol}://${resolveHost()}/parties/main/${roomId}`;
 }
+
+const MAX_BACKOFF_MS = 30_000;
 
 export type RoomConnection = {
   state: GameState | null;
@@ -30,22 +32,29 @@ export function useRoom(roomId: string | null): RoomConnection {
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const attemptRef = useRef(0);
   const cancelledRef = useRef(false);
 
   useEffect(() => {
     if (!roomId) return;
     cancelledRef.current = false;
+    attemptRef.current = 0;
 
     const connect = () => {
       if (cancelledRef.current) return;
       const ws = new WebSocket(wsUrl(roomId));
       wsRef.current = ws;
-      ws.onopen = () => setConnected(true);
+      ws.onopen = () => {
+        setConnected(true);
+        attemptRef.current = 0;
+      };
       ws.onclose = () => {
         setConnected(false);
         wsRef.current = null;
         if (!cancelledRef.current) {
-          reconnectRef.current = setTimeout(connect, 1000);
+          const delay = Math.min(MAX_BACKOFF_MS, 1000 * 2 ** attemptRef.current);
+          attemptRef.current++;
+          reconnectRef.current = setTimeout(connect, delay);
         }
       };
       ws.onerror = () => {

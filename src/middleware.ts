@@ -1,6 +1,10 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { AUTH_COOKIE_NAME, checkAuth } from "@/lib/auth";
 
+// Keep using the middleware convention (not proxy) because Next.js 16's `proxy`
+// only supports the Node.js runtime, and OpenNext on Cloudflare Workers requires
+// the Edge runtime. The proxy migration is documented at
+// https://nextjs.org/docs/messages/middleware-to-proxy
 export const runtime = "experimental-edge";
 
 const PUBLIC_PATHS = new Set(["/login"]);

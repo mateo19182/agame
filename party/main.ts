@@ -21,6 +21,8 @@ const TIEBREAKER_MS = 20000;
 const REFLEX_LIGHT_DELAY_MIN = 1200;
 const REFLEX_LIGHT_DELAY_MAX = 4000;
 const TRIVIA_CACHE_TTL = 60 * 60 * 24; // 1 day
+const STEAL_WINDOW_MS = 4000;
+const POST_TIEBREAKER_MS = 3000;
 
 const PLAYER_COLORS = ["#f97316", "#06b6d4", "#a855f7", "#22c55e", "#ec4899", "#eab308"];
 
@@ -49,6 +51,37 @@ function shuffle<T>(arr: T[]): T[] {
 }
 
 type ConnMeta = { playerId: string | null; isHost: boolean };
+
+type AlarmSpec =
+  | { kind: "round1-tick" }
+  | { kind: "round2-tick" }
+  | { kind: "round2-wager" }
+  | { kind: "answer"; playerId: string }
+  | { kind: "reveal-next" }
+  | { kind: "round3-answer" }
+  | { kind: "round3-reveal" }
+  | { kind: "tiebreaker-end" }
+  | { kind: "reflex-light" }
+  | { kind: "reflex-end" }
+  | { kind: "final-transition" };
+
+type RoomData = {
+  state: GameState;
+  playersById: Record<string, Player>;
+  questionsRef: { round1: Question[]; round2: Question[] };
+  photos: PhotoEntry[];
+  playerIdCounter: number;
+};
+
+function defaultRoomData(): RoomData {
+  return {
+    state: makeLobbyState("", defaultSettings()),
+    playersById: {},
+    questionsRef: { round1: [], round2: [] },
+    photos: [],
+    playerIdCounter: 0,
+  };
+}
 
 function decodeHtml(s: string): string {
   return s
@@ -131,45 +164,89 @@ function makeLobbyState(hostId: string, settings: GameSettings): GameState {
 
 export class GameRoom implements DurableObject {
   readonly state: DurableObjectState;
-  readonly data: {
-    state: GameState;
-    playersById: Record<string, Player>;
-    pendingTimers: ReturnType<typeof setTimeout>[];
-    questionsRef: { round1: Question[]; round2: Question[] };
-    photos: PhotoEntry[];
-    playerIdCounter: number;
-  };
+  data: RoomData;
 
   constructor(state: DurableObjectState, _env: Env) {
     this.state = state;
-    this.data = {
-      state: makeLobbyState("", defaultSettings()),
-      playersById: {},
-      pendingTimers: [],
-      questionsRef: { round1: [], round2: [] },
-      photos: [],
-      playerIdCounter: 0,
-    };
+    this.data = defaultRoomData();
 
     state.blockConcurrencyWhile(async () => {
-      const stored = await state.storage.get<{ settings?: GameSettings }>("settings");
-      if (stored?.settings) {
-        this.data.state.settings = { ...defaultSettings(), ...stored.settings };
+      const stored = await state.storage.get<RoomData>("game");
+      if (stored) {
+        this.data = stored;
+      }
+      const settingsWrapped = await state.storage.get<{ settings?: GameSettings }>("settings");
+      if (settingsWrapped?.settings) {
+        this.data.state.settings = { ...defaultSettings(), ...settingsWrapped.settings };
       }
     });
   }
 
-  private clearTimers() {
-    for (const t of this.data.pendingTimers) clearTimeout(t);
-    this.data.pendingTimers = [];
+  private async saveGame() {
+    await this.state.storage.put("game", this.data);
   }
 
-  private queueTimer(fn: () => void, ms: number) {
-    const t = setTimeout(() => {
-      this.data.pendingTimers = this.data.pendingTimers.filter((x) => x !== t);
-      fn();
-    }, ms);
-    this.data.pendingTimers.push(t);
+  private commit(partial: Partial<GameState>) {
+    this.data.state = { ...this.data.state, ...partial };
+    this.state.waitUntil(this.saveGame());
+  }
+
+  private async scheduleAlarm(spec: AlarmSpec, msFromNow: number) {
+    await this.state.storage.put("alarm", spec);
+    await this.state.storage.setAlarm(nowMs() + msFromNow);
+  }
+
+  private async clearAlarm() {
+    await this.state.storage.delete("alarm");
+    await this.state.storage.deleteAlarm();
+  }
+
+  async alarm(_alarmInfo?: AlarmInvocationInfo) {
+    const spec = await this.state.storage.get<AlarmSpec>("alarm");
+    await this.state.storage.delete("alarm");
+    await this.state.storage.deleteAlarm();
+    if (!spec) return;
+    // Rehydrate in case the DO was evicted and is waking up fresh.
+    const stored = await this.state.storage.get<RoomData>("game");
+    if (stored) this.data = stored;
+
+    switch (spec.kind) {
+      case "round1-tick":
+      case "round2-tick":
+        this.onTimerExpire();
+        break;
+      case "round2-wager":
+        this.beginRound2Question();
+        break;
+      case "answer": {
+        const cur = this.data.state.buzz;
+        if (cur && cur.status === "answering" && cur.buzzedBy === spec.playerId) {
+          this.resolveAnswer(spec.playerId, false);
+        }
+        break;
+      }
+      case "reveal-next":
+        this.advanceFromReveal();
+        break;
+      case "round3-answer":
+        this.onRound3AnswerTimeout();
+        break;
+      case "round3-reveal":
+        this.endRound3Photo();
+        break;
+      case "tiebreaker-end":
+        this.endMinigame();
+        break;
+      case "reflex-light":
+        this.showReflexLight();
+        break;
+      case "reflex-end":
+        this.endMinigame();
+        break;
+      case "final-transition":
+        this.endGame(this.data.state.minigame?.winnerId ?? null);
+        break;
+    }
   }
 
   private publicState(): GameState {
@@ -198,10 +275,6 @@ export class GameRoom implements DurableObject {
     }
   }
 
-  private setState(partial: Partial<GameState>) {
-    this.data.state = { ...this.data.state, ...partial };
-  }
-
   private async fetchQuestionsForRound(round: 1 | 2, settings: GameSettings): Promise<Question[]> {
     const count = round === 1 ? settings.round1Questions : settings.round2Questions;
     if (settings.pack === "us") {
@@ -217,8 +290,8 @@ export class GameRoom implements DurableObject {
     return fetchOpenTdbCached(count, settings.difficulty);
   }
 
-  private playerCount() {
-    return Object.values(this.data.playersById).filter((p) => p.connected).length;
+  private connectedPlayers() {
+    return Object.values(this.data.playersById).filter((p) => p.connected);
   }
 
   private newBuzz() {
@@ -231,6 +304,10 @@ export class GameRoom implements DurableObject {
     };
   }
 
+  private refreshPlayersList() {
+    this.data.state.players = this.connectedPlayers();
+  }
+
   private nextRound1Question() {
     const next = this.data.state.currentQuestion + 1;
     if (next >= this.data.questionsRef.round1.length) {
@@ -239,9 +316,9 @@ export class GameRoom implements DurableObject {
     }
     this.data.state.questions = this.data.questionsRef.round1;
     this.data.state.currentQuestion = next;
-    this.setState({ phase: "round1-question", buzz: this.newBuzz(), lastEvent: null });
+    this.commit({ phase: "round1-question", buzz: this.newBuzz(), lastEvent: null });
     this.broadcast();
-    this.queueTimer(() => this.onTimerExpire(), ROUND1_SECONDS * 1000);
+    void this.scheduleAlarm({ kind: "round1-tick" }, ROUND1_SECONDS * 1000);
   }
 
   private beginRound2Intro() {
@@ -249,13 +326,13 @@ export class GameRoom implements DurableObject {
     this.data.state.currentQuestion = 0;
     this.data.state.round = 2;
     this.data.state.wagers = {};
-    this.setState({ phase: "round2-wager", buzz: null, lastEvent: null });
+    this.commit({ phase: "round2-wager", buzz: null, lastEvent: null });
     this.broadcast();
-    this.queueTimer(() => this.beginRound2Question(), WAGER_SECONDS * 1000);
+    void this.scheduleAlarm({ kind: "round2-wager" }, WAGER_SECONDS * 1000);
   }
 
   private beginRound2Question() {
-    this.setState({
+    this.commit({
       phase: "round2-question",
       buzz: {
         buzzedBy: null,
@@ -266,7 +343,7 @@ export class GameRoom implements DurableObject {
       },
     });
     this.broadcast();
-    this.queueTimer(() => this.onTimerExpire(), ROUND2_SECONDS * 1000);
+    void this.scheduleAlarm({ kind: "round2-tick" }, ROUND2_SECONDS * 1000);
   }
 
   private nextRound2Question() {
@@ -281,14 +358,14 @@ export class GameRoom implements DurableObject {
     }
     this.data.state.currentQuestion = next;
     this.data.state.wagers = {};
-    this.setState({ phase: "round2-wager", buzz: null, lastEvent: null });
+    this.commit({ phase: "round2-wager", buzz: null, lastEvent: null });
     this.broadcast();
-    this.queueTimer(() => this.beginRound2Question(), WAGER_SECONDS * 1000);
+    void this.scheduleAlarm({ kind: "round2-wager" }, WAGER_SECONDS * 1000);
   }
 
   private beginRound3Intro() {
     this.data.state.round = 3;
-    this.setState({
+    this.commit({
       phase: "round3-intro",
       round3: null,
       buzz: null,
@@ -302,7 +379,7 @@ export class GameRoom implements DurableObject {
       this.beginFinal();
       return;
     }
-    this.setState({
+    this.commit({
       phase: "round3-photo",
       round3: {
         currentPhotoIndex: 0,
@@ -313,7 +390,7 @@ export class GameRoom implements DurableObject {
       },
     });
     this.broadcast();
-    this.queueTimer(() => this.onRound3AnswerTimeout(), ROUND3_ANSWER_SECONDS * 1000);
+    void this.scheduleAlarm({ kind: "round3-answer" }, ROUND3_ANSWER_SECONDS * 1000);
   }
 
   private onRound3AnswerTimeout() {
@@ -325,7 +402,7 @@ export class GameRoom implements DurableObject {
   private beginRound3Reveal() {
     const r3 = this.data.state.round3;
     if (!r3) return;
-    this.setState({
+    this.commit({
       phase: "round3-reveal",
       round3: {
         ...r3,
@@ -334,7 +411,7 @@ export class GameRoom implements DurableObject {
       },
     });
     this.broadcast();
-    this.queueTimer(() => this.endRound3Photo(), ROUND3_REVEAL_SECONDS * 1000);
+    void this.scheduleAlarm({ kind: "round3-reveal" }, ROUND3_REVEAL_SECONDS * 1000);
   }
 
   private endRound3Photo() {
@@ -349,10 +426,11 @@ export class GameRoom implements DurableObject {
     this.data.state.lastEvent = null;
     const next = r3.currentPhotoIndex + 1;
     if (next >= this.data.photos.length) {
+      this.state.waitUntil(this.saveGame());
       this.beginFinal();
       return;
     }
-    this.setState({
+    this.commit({
       round3: {
         currentPhotoIndex: next,
         phase: "answering",
@@ -363,17 +441,18 @@ export class GameRoom implements DurableObject {
       phase: "round3-photo",
     });
     this.broadcast();
-    this.queueTimer(() => this.onRound3AnswerTimeout(), ROUND3_ANSWER_SECONDS * 1000);
+    void this.scheduleAlarm({ kind: "round3-answer" }, ROUND3_ANSWER_SECONDS * 1000);
   }
 
   private onRound3Guess(playerId: string, where: string, when: string) {
     const r3 = this.data.state.round3;
     if (!r3 || r3.phase !== "answering") return;
     r3.guesses[playerId] = { where, when };
+    this.state.waitUntil(this.saveGame());
     this.broadcast();
-    const players = this.data.state.players.filter((p) => p.connected);
+    const players = this.connectedPlayers();
     if (players.every((p) => r3.guesses[p.id])) {
-      this.clearTimers();
+      void this.clearAlarm();
       this.beginRound3Reveal();
     }
   }
@@ -382,10 +461,11 @@ export class GameRoom implements DurableObject {
     const r3 = this.data.state.round3;
     if (!r3 || r3.phase !== "reveal") return;
     r3.selfScored[playerId] = { where, when };
+    this.state.waitUntil(this.saveGame());
     this.broadcast();
-    const players = this.data.state.players.filter((p) => p.connected);
+    const players = this.connectedPlayers();
     if (players.every((p) => r3.selfScored[p.id])) {
-      this.clearTimers();
+      void this.clearAlarm();
       this.endRound3Photo();
     }
   }
@@ -393,7 +473,7 @@ export class GameRoom implements DurableObject {
   private onRound3Next() {
     const r3 = this.data.state.round3;
     if (!r3 || r3.phase !== "reveal") return;
-    this.clearTimers();
+    void this.clearAlarm();
     this.endRound3Photo();
   }
 
@@ -409,7 +489,7 @@ export class GameRoom implements DurableObject {
   }
 
   private beginTiebreakerIntro() {
-    this.setState({ phase: "tiebreaker-intro", minigame: pickRandomMinigame() });
+    this.commit({ phase: "tiebreaker-intro", minigame: pickRandomMinigame() });
     this.broadcast();
   }
 
@@ -417,7 +497,7 @@ export class GameRoom implements DurableObject {
     const mg = this.data.state.minigame;
     if (!mg) return;
     if (mg.type === "reflex") {
-      this.setState({
+      this.commit({
         phase: "tiebreaker-play",
         minigame: {
           ...mg,
@@ -433,31 +513,33 @@ export class GameRoom implements DurableObject {
       this.broadcast();
       this.scheduleReflexLight();
     } else if (mg.type === "speed-sort") {
-      this.setState({
+      this.commit({
         phase: "tiebreaker-play",
         minigame: { ...mg, startedAt: nowMs(), duration: TIEBREAKER_MS, progress: { p1: 0, p2: 0 }, winnerId: null, status: "live" },
       });
       this.broadcast();
-      this.queueTimer(() => this.endMinigame(), TIEBREAKER_MS);
+      void this.scheduleAlarm({ kind: "tiebreaker-end" }, TIEBREAKER_MS);
     } else {
-      this.setState({
+      this.commit({
         phase: "tiebreaker-play",
         minigame: { ...mg, startedAt: nowMs(), duration: TIEBREAKER_MS, typed: { p1: "", p2: "" }, finishedAt: { p1: null, p2: null }, winnerId: null, status: "live" },
       });
       this.broadcast();
-      this.queueTimer(() => this.endMinigame(), TIEBREAKER_MS);
+      void this.scheduleAlarm({ kind: "tiebreaker-end" }, TIEBREAKER_MS);
     }
   }
 
   private scheduleReflexLight() {
     const delay = REFLEX_LIGHT_DELAY_MIN + Math.random() * (REFLEX_LIGHT_DELAY_MAX - REFLEX_LIGHT_DELAY_MIN);
-    this.queueTimer(() => {
-      const mg = this.data.state.minigame;
-      if (!mg || mg.type !== "reflex" || mg.status !== "live") return;
-      this.setState({ minigame: { ...mg, lightsOn: true, lightOnAt: nowMs() } });
-      this.broadcast();
-      this.queueTimer(() => this.endMinigame(), 1500);
-    }, delay);
+    void this.scheduleAlarm({ kind: "reflex-light" }, delay);
+  }
+
+  private showReflexLight() {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.type !== "reflex" || mg.status !== "live") return;
+    this.commit({ minigame: { ...mg, lightsOn: true, lightOnAt: nowMs() } });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "reflex-end" }, 1500);
   }
 
   private endMinigame() {
@@ -478,46 +560,49 @@ export class GameRoom implements DurableObject {
       else if (p1Done) winnerId = p1.id;
       else if (p2Done) winnerId = p2.id;
     }
-    this.setState({ phase: "tiebreaker-result", minigame: { ...mg, winnerId, status: "done" } });
+    this.commit({ phase: "tiebreaker-result", minigame: { ...mg, winnerId, status: "done" } });
     this.broadcast();
-    this.queueTimer(() => {
-      const next = winnerId ?? this.data.state.players[0]?.id ?? null;
-      this.endGame(next);
-    }, 3000);
+    void this.scheduleAlarm({ kind: "final-transition" }, POST_TIEBREAKER_MS);
   }
 
   private endGame(winnerId: string | null) {
     void winnerId;
-    this.clearTimers();
-    this.setState({ phase: "final", buzz: null, minigame: null, lastEvent: null });
+    void this.clearAlarm();
+    this.commit({ phase: "final", buzz: null, minigame: null, lastEvent: null });
     this.broadcast();
   }
 
   private onTimerExpire() {
     const phase = this.data.state.phase;
     if (phase === "round1-question") {
-      this.setState({
+      this.commit({
         phase: "round1-reveal",
         buzz: { ...(this.data.state.buzz!), status: "reveal", answerCorrect: false, buzzedBy: this.data.state.buzz?.buzzedBy ?? null },
         lastEvent: { kind: "timeout", playerId: null, delta: 0 },
       });
       this.broadcast();
-      this.queueTimer(() => this.nextRound1Question(), REVEAL_MS);
+      void this.scheduleAlarm({ kind: "reveal-next" }, REVEAL_MS);
     } else if (phase === "round1-reveal") {
       this.nextRound1Question();
     } else if (phase === "round2-question") {
-      this.setState({
+      this.commit({
         phase: "round2-reveal",
         buzz: { ...(this.data.state.buzz!), status: "reveal", answerCorrect: false },
         lastEvent: { kind: "timeout", playerId: null, delta: 0 },
       });
       this.broadcast();
-      this.queueTimer(() => this.nextRound2Question(), REVEAL_MS);
+      void this.scheduleAlarm({ kind: "reveal-next" }, REVEAL_MS);
     } else if (phase === "round2-wager") {
       this.beginRound2Question();
     } else if (phase === "tiebreaker-play") {
       this.endMinigame();
     }
+  }
+
+  private advanceFromReveal() {
+    const phase = this.data.state.phase;
+    if (phase === "round1-reveal") this.nextRound1Question();
+    else if (phase === "round2-reveal") this.nextRound2Question();
   }
 
   private onBuzz(playerId: string) {
@@ -528,14 +613,9 @@ export class GameRoom implements DurableObject {
     const newBuzz = { ...buzz, buzzedBy: playerId, buzzedAt: nowMs(), status: "answering" as const };
     const answerDeadline = nowMs() + ANSWER_SECONDS * 1000;
     newBuzz.timerEndsAt = answerDeadline;
-    this.setState({ buzz: newBuzz });
+    this.commit({ buzz: newBuzz });
     this.broadcast();
-    this.queueTimer(() => {
-      const cur = this.data.state.buzz;
-      if (cur && cur.status === "answering" && cur.buzzedBy === playerId) {
-        this.resolveAnswer(playerId, false);
-      }
-    }, ANSWER_SECONDS * 1000);
+    void this.scheduleAlarm({ kind: "answer", playerId }, ANSWER_SECONDS * 1000);
   }
 
   private onAnswer(playerId: string, correct: boolean) {
@@ -552,52 +632,49 @@ export class GameRoom implements DurableObject {
     if (correct) {
       const delta = phase === "round2-question" ? (this.data.state.wagers[playerId] ?? 0) : 1;
       player.score += delta;
-      this.setState({
+      this.commit({
         phase: phase === "round1-question" ? "round1-reveal" : "round2-reveal",
         buzz: { ...(this.data.state.buzz!), status: "reveal", answerCorrect: true },
         lastEvent: { kind: "correct", playerId, delta },
       });
       this.broadcast();
-      this.queueTimer(
-        () => (phase === "round1-question" ? this.nextRound1Question() : this.nextRound2Question()),
-        REVEAL_MS
-      );
+      void this.scheduleAlarm({ kind: "reveal-next" }, REVEAL_MS);
     } else {
       if (phase === "round1-question") {
         const other = players.find((p) => p.id !== playerId && p.connected);
         if (other) {
-          this.setState({
+          this.commit({
             buzz: {
               ...(this.data.state.buzz!),
               status: "buzzing",
               buzzedBy: null,
               buzzedAt: null,
-              timerEndsAt: nowMs() + 4000,
+              timerEndsAt: nowMs() + STEAL_WINDOW_MS,
               answerCorrect: null,
             },
             lastEvent: { kind: "wrong", playerId, delta: 0 },
           });
           this.broadcast();
-          this.queueTimer(() => this.onTimerExpire(), 4000);
+          void this.scheduleAlarm({ kind: "round1-tick" }, STEAL_WINDOW_MS);
         } else {
-          this.setState({
+          this.commit({
             phase: "round1-reveal",
             buzz: { ...(this.data.state.buzz!), status: "reveal", answerCorrect: false },
             lastEvent: { kind: "wrong", playerId, delta: 0 },
           });
           this.broadcast();
-          this.queueTimer(() => this.nextRound1Question(), REVEAL_MS);
+          void this.scheduleAlarm({ kind: "reveal-next" }, REVEAL_MS);
         }
       } else {
         const delta = -(this.data.state.wagers[playerId] ?? 0);
         player.score = Math.max(0, player.score + delta);
-        this.setState({
+        this.commit({
           phase: "round2-reveal",
           buzz: { ...(this.data.state.buzz!), status: "reveal", answerCorrect: false },
           lastEvent: { kind: "wrong", playerId, delta },
         });
         this.broadcast();
-        this.queueTimer(() => this.nextRound2Question(), REVEAL_MS);
+        void this.scheduleAlarm({ kind: "reveal-next" }, REVEAL_MS);
       }
     }
   }
@@ -609,11 +686,12 @@ export class GameRoom implements DurableObject {
     const max = Math.max(1, player.score);
     const safe = Math.max(0, Math.min(max, Math.floor(amount)));
     this.data.state.wagers = { ...this.data.state.wagers, [playerId]: safe };
+    this.state.waitUntil(this.saveGame());
     this.broadcast();
-    const players = this.data.state.players.filter((p) => p.connected);
+    const players = this.connectedPlayers();
     if (players.every((p) => this.data.state.wagers[p.id] !== undefined)) {
-      this.clearTimers();
-      this.queueTimer(() => this.beginRound2Question(), 800);
+      void this.clearAlarm();
+      this.beginRound2Question();
     }
   }
 
@@ -627,7 +705,7 @@ export class GameRoom implements DurableObject {
     if (mg.type === "reflex") {
       if (!mg.lightsOn) return;
       if (typeof payload === "object" && payload && (payload as { tap?: boolean }).tap) {
-        this.setState({ minigame: { ...mg, taps: { ...mg.taps, [key]: mg.taps[key] + 1 } } });
+        this.commit({ minigame: { ...mg, taps: { ...mg.taps, [key]: mg.taps[key] + 1 } } });
         this.broadcast();
       }
     } else if (mg.type === "speed-sort") {
@@ -635,7 +713,7 @@ export class GameRoom implements DurableObject {
       if (!p) return;
       const newProgress = { ...mg.progress };
       if (p.correct) newProgress[key] = Math.min(mg.items.length, newProgress[key] + 1);
-      this.setState({ minigame: { ...mg, progress: newProgress } });
+      this.commit({ minigame: { ...mg, progress: newProgress } });
       this.broadcast();
       if (newProgress.p1 >= mg.items.length || newProgress.p2 >= mg.items.length) {
         this.endMinigame();
@@ -646,7 +724,7 @@ export class GameRoom implements DurableObject {
       const typed = { ...mg.typed, [key]: p.typed };
       const finishedAt = { ...mg.finishedAt };
       if (p.typed === mg.prompt && finishedAt[key] === null) finishedAt[key] = nowMs();
-      this.setState({ minigame: { ...mg, typed, finishedAt } });
+      this.commit({ minigame: { ...mg, typed, finishedAt } });
       this.broadcast();
       if (finishedAt.p1 !== null || finishedAt.p2 !== null) {
         const done = Object.values(finishedAt).filter((v) => v !== null).length;
@@ -657,13 +735,14 @@ export class GameRoom implements DurableObject {
 
   private onPlayAgain() {
     if (this.data.state.phase !== "final") return;
-    this.clearTimers();
+    void this.clearAlarm();
     for (const id of Object.keys(this.data.playersById)) {
       this.data.playersById[id].score = 0;
     }
     this.data.state = makeLobbyState(this.data.state.hostId, this.data.state.settings);
-    this.data.state.players = Object.values(this.data.playersById).filter((p) => p.connected);
+    this.refreshPlayersList();
     this.data.photos = [];
+    this.state.waitUntil(this.saveGame());
     this.broadcast();
   }
 
@@ -691,30 +770,40 @@ export class GameRoom implements DurableObject {
     if (isHost && !this.data.state.hostId) {
       this.data.state.hostId = id;
     }
-    if (this.data.state.phase === "lobby") {
-      this.data.state.players = Object.values(this.data.playersById).filter((p) => p.connected);
+    this.refreshPlayersList();
+    this.state.waitUntil(this.saveGame());
+  }
+
+  private reattachPlayer(ws: WebSocket, playerId: string) {
+    const player = this.data.playersById[playerId];
+    if (!player) return false;
+    player.connected = true;
+    ws.serializeAttachment({ playerId, isHost: player.isHost } satisfies ConnMeta);
+    if (player.isHost && !this.data.state.hostId) {
+      this.data.state.hostId = playerId;
     }
+    this.refreshPlayersList();
+    this.state.waitUntil(this.saveGame());
+    return true;
   }
 
   private removePlayer(playerId: string) {
     const player = this.data.playersById[playerId];
     if (!player) return;
     player.connected = false;
-    if (this.data.state.phase === "lobby") {
-      this.data.state.players = Object.values(this.data.playersById).filter((p) => p.connected);
-    }
+    this.refreshPlayersList();
+    this.state.waitUntil(this.saveGame());
   }
 
   private async startGame(settingsOverride?: GameSettings, photosOverride?: PhotoEntry[]) {
     if (this.data.state.phase !== "lobby") return;
-    if (this.playerCount() < 2) {
+    if (this.connectedPlayers().length < 2) {
       this.broadcastError("Need 2 players to start");
       return;
     }
-    // Atomic phase transition — protects against double-start (and persists across DO eviction)
     if (await this.state.storage.get<boolean>("starting")) return;
     await this.state.storage.put("starting", true);
-    this.clearTimers();
+    void this.clearAlarm();
     if (settingsOverride) {
       this.data.state.settings = { ...defaultSettings(), ...settingsOverride };
       await this.state.storage.put("settings", { settings: this.data.state.settings });
@@ -731,9 +820,9 @@ export class GameRoom implements DurableObject {
       this.data.state.currentQuestion = 0;
       this.data.state.round = 1;
       this.data.state.lastEvent = null;
-      this.setState({ phase: "round1-question", buzz: this.newBuzz() });
+      this.commit({ phase: "round1-question", buzz: this.newBuzz() });
       this.broadcast();
-      this.queueTimer(() => this.onTimerExpire(), ROUND1_SECONDS * 1000);
+      void this.scheduleAlarm({ kind: "round1-tick" }, ROUND1_SECONDS * 1000);
     } catch (err) {
       this.broadcastError(`Trivia fetch failed: ${(err as Error).message}`);
     } finally {
@@ -776,6 +865,16 @@ export class GameRoom implements DurableObject {
         this.addPlayer(ws, msg.name, false);
         this.broadcast();
         return;
+      case "rejoin": {
+        if (meta.playerId) return;
+        const ok = this.reattachPlayer(ws, msg.playerId);
+        if (!ok) {
+          this.sendError(ws, "Player not found, please rejoin with a new identity");
+          return;
+        }
+        this.broadcast();
+        return;
+      }
       case "start-game":
         if (meta.playerId !== this.data.state.hostId) return;
         await this.startGame(msg.settings, msg.photos);

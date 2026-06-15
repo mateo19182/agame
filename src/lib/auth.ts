@@ -27,6 +27,10 @@ function constantTimeEqual(a: Uint8Array, b: Uint8Array): boolean {
   return r === 0;
 }
 
+export function constantTimeEqualString(a: string, b: string): boolean {
+  return constantTimeEqual(new TextEncoder().encode(a), new TextEncoder().encode(b));
+}
+
 export async function signAuthCookie(cookieValue?: string): Promise<string | undefined> {
   if (!cookieValue) return undefined;
   const key = await crypto.subtle.importKey(
