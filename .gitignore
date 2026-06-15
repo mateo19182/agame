@@ -47,6 +47,8 @@ next-env.d.ts
 .wrangler
 .dev.vars*
 !.dev.vars.example
+worker-configuration.d.ts
 
-# PartyKit local dev state (SQLite blobs)
-.partykit/
+# agent skills (installed locally by `npx skills add`)
+.agents/
+skills-lock.json

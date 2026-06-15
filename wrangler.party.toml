@@ -10,9 +10,17 @@ new_sqlite_classes = ["BuzzerServer"]
 tag = "v2"
 new_sqlite_classes = ["PartyDurable"]
 
+[[migrations]]
+tag = "v3"
+deleted_classes = ["BuzzerServer"]
+
+[[migrations]]
+tag = "v4"
+renamed_classes = [{ from = "PartyDurable", to = "GameRoom" }]
+
 [[durable_objects.bindings]]
 name = "PARTYKIT_DURABLE"
-class_name = "PartyDurable"
+class_name = "GameRoom"
 
 [vars]
 PARTYKIT_HOST = "agame-party.mateoamadoares.workers.dev"

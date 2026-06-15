@@ -6,19 +6,18 @@
     "build": "next build",
     "dev": "concurrently --kill-others-on-fail -n next,party -c blue,magenta \"pnpm dev:next\" \"pnpm dev:party\"",
     "dev:next": "next dev",
-    "dev:party": "partykit dev",
+    "dev:party": "wrangler dev --config wrangler.party.toml --port 1999",
     "start": "next start",
     "lint": "eslint",
     "preview": "opennextjs-cloudflare build && opennextjs-cloudflare preview",
     "deploy": "opennextjs-cloudflare build && opennextjs-cloudflare deploy",
+    "deploy:party": "wrangler deploy --config wrangler.party.toml",
     "upload": "opennextjs-cloudflare build && opennextjs-cloudflare upload",
-    "cf-typegen": "wrangler types --env-interface CloudflareEnv cloudflare-env.d.ts"
+    "cf-typegen": "wrangler types --config wrangler.party.toml --env-interface CloudflareEnv cloudflare-env.d.ts"
   },
   "dependencies": {
     "canvas-confetti": "^1.9.4",
     "next": "16.2.9",
-    "partykit": "^0.0.115",
-    "partysocket": "^1.2.0",
     "react": "19.2.4",
     "react-dom": "19.2.4"
   },

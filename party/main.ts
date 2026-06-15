@@ -1,4 +1,3 @@
-import type * as Party from "partykit/server";
 import type {
   GameSettings,
   GameState,
@@ -21,6 +20,7 @@ const ROUND3_REVEAL_SECONDS = 15;
 const TIEBREAKER_MS = 20000;
 const REFLEX_LIGHT_DELAY_MIN = 1200;
 const REFLEX_LIGHT_DELAY_MAX = 4000;
+const TRIVIA_CACHE_TTL = 60 * 60 * 24; // 1 day
 
 const PLAYER_COLORS = ["#f97316", "#06b6d4", "#a855f7", "#22c55e", "#ec4899", "#eab308"];
 
@@ -48,14 +48,68 @@ function shuffle<T>(arr: T[]): T[] {
   return copy;
 }
 
-type ServerData = {
-  state: GameState;
-  connToPlayer: Record<string, string>;
-  playersById: Record<string, Player>;
-  pendingTimers: ReturnType<typeof setTimeout>[];
-  questionsRef: { round1: Question[]; round2: Question[] };
-  photos: PhotoEntry[];
-};
+type ConnMeta = { playerId: string | null; isHost: boolean };
+
+function decodeHtml(s: string): string {
+  return s
+    .replace(/&quot;/g, '"')
+    .replace(/&#039;/g, "'")
+    .replace(/&amp;/g, "&")
+    .replace(/&eacute;/g, "é")
+    .replace(/&Eacute;/g, "É")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">");
+}
+
+async function fetchOpenTdb(count: number, difficulty: string): Promise<Question[]> {
+  const url = `https://opentdb.com/api.php?amount=${count}&difficulty=${difficulty}&type=multiple&encode=url3986`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`OpenTDB ${res.status}`);
+  const data = (await res.json()) as {
+    response_code: number;
+    results: Array<{
+      category: string;
+      question: string;
+      correct_answer: string;
+      incorrect_answers: string[];
+    }>;
+  };
+  if (data.response_code !== 0) throw new Error(`OpenTDB code ${data.response_code}`);
+  return data.results.map((r, i) => {
+    const correct = decodeHtml(decodeURIComponent(r.correct_answer));
+    const incorrects = r.incorrect_answers.map((a) => decodeHtml(decodeURIComponent(a)));
+    const options = shuffle([correct, ...incorrects]);
+    return {
+      id: `otdb-${i}-${Math.random().toString(36).slice(2, 6)}`,
+      prompt: decodeHtml(decodeURIComponent(r.question)),
+      options,
+      correctIndex: options.indexOf(correct),
+      category: decodeHtml(decodeURIComponent(r.category)),
+      source: "opentdb" as const,
+    };
+  });
+}
+
+async function fetchOpenTdbCached(count: number, difficulty: string): Promise<Question[]> {
+  const cache = caches.default;
+  const cacheKey = `https://trivia-cache.internal/?d=${difficulty}&n=${count}`;
+  const cached = await cache.match(cacheKey);
+  if (cached) {
+    try {
+      return (await cached.json()) as Question[];
+    } catch {
+      // fall through to refresh
+    }
+  }
+  const questions = await fetchOpenTdb(count, difficulty);
+  await cache.put(
+    cacheKey,
+    new Response(JSON.stringify(questions), {
+      headers: { "cache-control": `max-age=${TRIVIA_CACHE_TTL}` },
+    })
+  );
+  return questions;
+}
 
 function makeLobbyState(hostId: string, settings: GameSettings): GameState {
   return {
@@ -75,47 +129,42 @@ function makeLobbyState(hostId: string, settings: GameSettings): GameState {
   };
 }
 
-interface DurableObjectNamespace {
-  idFromName(name: string): DurableObjectId;
-  get(id: DurableObjectId): { fetch(request: Request): Promise<Response> };
-}
-interface DurableObjectId {
-  toString(): string;
-}
-interface ExecutionContext {
-  waitUntil(promise: Promise<unknown>): void;
-  passThroughOnException(): void;
-}
+export class GameRoom implements DurableObject {
+  readonly state: DurableObjectState;
+  readonly data: {
+    state: GameState;
+    playersById: Record<string, Player>;
+    pendingTimers: ReturnType<typeof setTimeout>[];
+    questionsRef: { round1: Question[]; round2: Question[] };
+    photos: PhotoEntry[];
+    playerIdCounter: number;
+  };
 
-class BuzzerServer implements Party.Server {
-  readonly data: ServerData;
-  readonly room: Party.Room;
-
-  constructor(room: Party.Room) {
-    this.room = room;
+  constructor(state: DurableObjectState, _env: Env) {
+    this.state = state;
     this.data = {
       state: makeLobbyState("", defaultSettings()),
-      connToPlayer: {},
       playersById: {},
       pendingTimers: [],
       questionsRef: { round1: [], round2: [] },
       photos: [],
+      playerIdCounter: 0,
     };
+
+    state.blockConcurrencyWhile(async () => {
+      const stored = await state.storage.get<{ settings?: GameSettings }>("settings");
+      if (stored?.settings) {
+        this.data.state.settings = { ...defaultSettings(), ...stored.settings };
+      }
+    });
   }
 
-  async onStart() {
-    const stored = await this.room.storage.get<{ settings?: GameSettings }>("settings");
-    if (stored?.settings) {
-      this.data.state.settings = { ...defaultSettings(), ...stored.settings };
-    }
-  }
-
-  clearTimers() {
+  private clearTimers() {
     for (const t of this.data.pendingTimers) clearTimeout(t);
     this.data.pendingTimers = [];
   }
 
-  queueTimer(fn: () => void, ms: number) {
+  private queueTimer(fn: () => void, ms: number) {
     const t = setTimeout(() => {
       this.data.pendingTimers = this.data.pendingTimers.filter((x) => x !== t);
       fn();
@@ -123,19 +172,37 @@ class BuzzerServer implements Party.Server {
     this.data.pendingTimers.push(t);
   }
 
-  broadcast() {
-    const payload = { ...this.data.state, photos: this.data.photos };
-    for (const conn of this.room.getConnections()) {
-      const playerId = this.data.connToPlayer[conn.id];
-      conn.send(JSON.stringify({ type: "state", state: payload, youId: playerId ?? "" }));
+  private publicState(): GameState {
+    return { ...this.data.state, photos: this.data.photos };
+  }
+
+  private sendTo(ws: WebSocket, payload: unknown) {
+    try {
+      ws.send(JSON.stringify(payload));
+    } catch {}
+  }
+
+  private sendError(ws: WebSocket, message: string) {
+    this.sendTo(ws, { type: "error", message });
+  }
+
+  private broadcastError(message: string) {
+    for (const ws of this.state.getWebSockets()) this.sendError(ws, message);
+  }
+
+  private broadcast() {
+    const payload = this.publicState();
+    for (const ws of this.state.getWebSockets()) {
+      const meta = ws.deserializeAttachment() as ConnMeta | null;
+      this.sendTo(ws, { type: "state", state: payload, youId: meta?.playerId ?? "" });
     }
   }
 
-  setState(partial: Partial<GameState>) {
+  private setState(partial: Partial<GameState>) {
     this.data.state = { ...this.data.state, ...partial };
   }
 
-  async fetchQuestionsForRound(round: 1 | 2, settings: GameSettings): Promise<Question[]> {
+  private async fetchQuestionsForRound(round: 1 | 2, settings: GameSettings): Promise<Question[]> {
     const count = round === 1 ? settings.round1Questions : settings.round2Questions;
     if (settings.pack === "us") {
       return shuffle(getUsQuestions()).slice(0, count);
@@ -144,93 +211,17 @@ class BuzzerServer implements Party.Server {
       const half = Math.ceil(count / 2);
       const us = shuffle(getUsQuestions()).slice(0, half);
       const rest = count - half;
-      const otdb = await fetchOpenTdb(rest, settings.difficulty);
+      const otdb = await fetchOpenTdbCached(rest, settings.difficulty);
       return shuffle([...us, ...otdb]);
     }
-    return fetchOpenTdb(count, settings.difficulty);
+    return fetchOpenTdbCached(count, settings.difficulty);
   }
 
-  playerCount() {
+  private playerCount() {
     return Object.values(this.data.playersById).filter((p) => p.connected).length;
   }
 
-  addPlayer(conn: Party.Connection, name: string, isHost: boolean) {
-    if (this.data.connToPlayer[conn.id]) return;
-    if (!isHost && this.data.state.phase !== "lobby") {
-      conn.send(JSON.stringify({ type: "error", message: "Game already in progress" }));
-      return;
-    }
-    const trimmed = (name || (isHost ? "Host" : "Player")).trim().slice(0, 16) || "Player";
-    const id = conn.id;
-    const takenColors = new Set(Object.values(this.data.playersById).map((p) => p.color));
-    const color = PLAYER_COLORS.find((c) => !takenColors.has(c)) ?? PLAYER_COLORS[0];
-    const player: Player = {
-      id,
-      name: trimmed,
-      score: 0,
-      color,
-      isHost,
-      connected: true,
-    };
-    this.data.playersById[id] = player;
-    this.data.connToPlayer[conn.id] = id;
-    if (isHost && !this.data.state.hostId) {
-      this.data.state.hostId = id;
-    }
-    if (this.data.state.phase === "lobby") {
-      this.data.state.players = Object.values(this.data.playersById).filter((p) => p.connected);
-    }
-  }
-
-  removePlayer(conn: Party.Connection) {
-    const playerId = this.data.connToPlayer[conn.id];
-    if (!playerId) return;
-    const player = this.data.playersById[playerId];
-    if (player) {
-      player.connected = false;
-    }
-    delete this.data.connToPlayer[conn.id];
-    if (this.data.state.phase === "lobby") {
-      this.data.state.players = Object.values(this.data.playersById).filter((p) => p.connected);
-    }
-  }
-
-  async startGame(settingsOverride?: GameSettings, photosOverride?: PhotoEntry[]) {
-    if (this.data.state.phase !== "lobby") return;
-    if (this.playerCount() < 2) {
-      for (const c of this.room.getConnections()) {
-        c.send(JSON.stringify({ type: "error", message: "Need 2 players to start" }));
-      }
-      return;
-    }
-    this.clearTimers();
-    if (settingsOverride) {
-      this.data.state.settings = { ...defaultSettings(), ...settingsOverride };
-      await this.room.storage.put("settings", { settings: this.data.state.settings });
-    }
-    this.data.photos = (photosOverride ?? []).filter(
-      (p) => p && p.dataUrl && (p.where || p.when)
-    );
-    const settings = this.data.state.settings;
-    try {
-      const questions = await this.fetchQuestionsForRound(1, settings);
-      this.data.questionsRef.round1 = questions;
-      this.data.questionsRef.round2 = await this.fetchQuestionsForRound(2, settings);
-      this.data.state.questions = questions;
-      this.data.state.currentQuestion = 0;
-      this.data.state.round = 1;
-      this.data.state.lastEvent = null;
-      this.setState({ phase: "round1-question", buzz: this.newBuzz() });
-      this.broadcast();
-      this.queueTimer(() => this.onTimerExpire(), ROUND1_SECONDS * 1000);
-    } catch (err) {
-      for (const c of this.room.getConnections()) {
-        c.send(JSON.stringify({ type: "error", message: `Trivia fetch failed: ${(err as Error).message}` }));
-      }
-    }
-  }
-
-  newBuzz() {
+  private newBuzz() {
     return {
       buzzedBy: null,
       buzzedAt: null,
@@ -240,7 +231,7 @@ class BuzzerServer implements Party.Server {
     };
   }
 
-  nextRound1Question() {
+  private nextRound1Question() {
     const next = this.data.state.currentQuestion + 1;
     if (next >= this.data.questionsRef.round1.length) {
       this.beginRound2Intro();
@@ -253,7 +244,7 @@ class BuzzerServer implements Party.Server {
     this.queueTimer(() => this.onTimerExpire(), ROUND1_SECONDS * 1000);
   }
 
-  beginRound2Intro() {
+  private beginRound2Intro() {
     this.data.state.questions = this.data.questionsRef.round2;
     this.data.state.currentQuestion = 0;
     this.data.state.round = 2;
@@ -263,7 +254,7 @@ class BuzzerServer implements Party.Server {
     this.queueTimer(() => this.beginRound2Question(), WAGER_SECONDS * 1000);
   }
 
-  beginRound2Question() {
+  private beginRound2Question() {
     this.setState({
       phase: "round2-question",
       buzz: {
@@ -278,7 +269,7 @@ class BuzzerServer implements Party.Server {
     this.queueTimer(() => this.onTimerExpire(), ROUND2_SECONDS * 1000);
   }
 
-  nextRound2Question() {
+  private nextRound2Question() {
     const next = this.data.state.currentQuestion + 1;
     if (next >= this.data.questionsRef.round2.length) {
       if (this.data.photos.length > 0) {
@@ -295,7 +286,7 @@ class BuzzerServer implements Party.Server {
     this.queueTimer(() => this.beginRound2Question(), WAGER_SECONDS * 1000);
   }
 
-  beginRound3Intro() {
+  private beginRound3Intro() {
     this.data.state.round = 3;
     this.setState({
       phase: "round3-intro",
@@ -306,7 +297,7 @@ class BuzzerServer implements Party.Server {
     this.broadcast();
   }
 
-  startRound3() {
+  private startRound3() {
     if (this.data.photos.length === 0) {
       this.beginFinal();
       return;
@@ -325,13 +316,13 @@ class BuzzerServer implements Party.Server {
     this.queueTimer(() => this.onRound3AnswerTimeout(), ROUND3_ANSWER_SECONDS * 1000);
   }
 
-  onRound3AnswerTimeout() {
+  private onRound3AnswerTimeout() {
     const r3 = this.data.state.round3;
     if (!r3 || r3.phase !== "answering") return;
     this.beginRound3Reveal();
   }
 
-  beginRound3Reveal() {
+  private beginRound3Reveal() {
     const r3 = this.data.state.round3;
     if (!r3) return;
     this.setState({
@@ -346,7 +337,7 @@ class BuzzerServer implements Party.Server {
     this.queueTimer(() => this.endRound3Photo(), ROUND3_REVEAL_SECONDS * 1000);
   }
 
-  endRound3Photo() {
+  private endRound3Photo() {
     const r3 = this.data.state.round3;
     if (!r3) return;
     const players = this.data.state.players;
@@ -375,7 +366,7 @@ class BuzzerServer implements Party.Server {
     this.queueTimer(() => this.onRound3AnswerTimeout(), ROUND3_ANSWER_SECONDS * 1000);
   }
 
-  onRound3Guess(playerId: string, where: string, when: string) {
+  private onRound3Guess(playerId: string, where: string, when: string) {
     const r3 = this.data.state.round3;
     if (!r3 || r3.phase !== "answering") return;
     r3.guesses[playerId] = { where, when };
@@ -387,7 +378,7 @@ class BuzzerServer implements Party.Server {
     }
   }
 
-  onRound3SelfScore(playerId: string, where: boolean, when: boolean) {
+  private onRound3SelfScore(playerId: string, where: boolean, when: boolean) {
     const r3 = this.data.state.round3;
     if (!r3 || r3.phase !== "reveal") return;
     r3.selfScored[playerId] = { where, when };
@@ -399,14 +390,14 @@ class BuzzerServer implements Party.Server {
     }
   }
 
-  onRound3Next() {
+  private onRound3Next() {
     const r3 = this.data.state.round3;
     if (!r3 || r3.phase !== "reveal") return;
     this.clearTimers();
     this.endRound3Photo();
   }
 
-  beginFinal() {
+  private beginFinal() {
     const players = this.data.state.players;
     const top = Math.max(...players.map((p) => p.score));
     const leaders = players.filter((p) => p.score === top);
@@ -417,12 +408,12 @@ class BuzzerServer implements Party.Server {
     this.endGame(leaders[0]?.id ?? null);
   }
 
-  beginTiebreakerIntro() {
+  private beginTiebreakerIntro() {
     this.setState({ phase: "tiebreaker-intro", minigame: pickRandomMinigame() });
     this.broadcast();
   }
 
-  startTiebreaker() {
+  private startTiebreaker() {
     const mg = this.data.state.minigame;
     if (!mg) return;
     if (mg.type === "reflex") {
@@ -458,7 +449,7 @@ class BuzzerServer implements Party.Server {
     }
   }
 
-  scheduleReflexLight() {
+  private scheduleReflexLight() {
     const delay = REFLEX_LIGHT_DELAY_MIN + Math.random() * (REFLEX_LIGHT_DELAY_MAX - REFLEX_LIGHT_DELAY_MIN);
     this.queueTimer(() => {
       const mg = this.data.state.minigame;
@@ -469,7 +460,7 @@ class BuzzerServer implements Party.Server {
     }, delay);
   }
 
-  endMinigame() {
+  private endMinigame() {
     const mg = this.data.state.minigame;
     if (!mg) return;
     let winnerId: string | null = null;
@@ -495,14 +486,14 @@ class BuzzerServer implements Party.Server {
     }, 3000);
   }
 
-  endGame(winnerId: string | null) {
+  private endGame(winnerId: string | null) {
     void winnerId;
     this.clearTimers();
     this.setState({ phase: "final", buzz: null, minigame: null, lastEvent: null });
     this.broadcast();
   }
 
-  onTimerExpire() {
+  private onTimerExpire() {
     const phase = this.data.state.phase;
     if (phase === "round1-question") {
       this.setState({
@@ -529,7 +520,7 @@ class BuzzerServer implements Party.Server {
     }
   }
 
-  onBuzz(playerId: string) {
+  private onBuzz(playerId: string) {
     const phase = this.data.state.phase;
     const buzz = this.data.state.buzz;
     if (!buzz || buzz.status !== "buzzing" || buzz.buzzedBy) return;
@@ -547,13 +538,13 @@ class BuzzerServer implements Party.Server {
     }, ANSWER_SECONDS * 1000);
   }
 
-  onAnswer(playerId: string, correct: boolean) {
+  private onAnswer(playerId: string, correct: boolean) {
     const buzz = this.data.state.buzz;
     if (!buzz || buzz.status !== "answering" || buzz.buzzedBy !== playerId) return;
     this.resolveAnswer(playerId, correct);
   }
 
-  resolveAnswer(playerId: string, correct: boolean) {
+  private resolveAnswer(playerId: string, correct: boolean) {
     const phase = this.data.state.phase;
     const players = this.data.state.players;
     const player = players.find((p) => p.id === playerId);
@@ -611,7 +602,7 @@ class BuzzerServer implements Party.Server {
     }
   }
 
-  onSetWager(playerId: string, amount: number) {
+  private onSetWager(playerId: string, amount: number) {
     if (this.data.state.phase !== "round2-wager") return;
     const player = this.data.state.players.find((p) => p.id === playerId);
     if (!player) return;
@@ -626,7 +617,7 @@ class BuzzerServer implements Party.Server {
     }
   }
 
-  onMinigameInput(playerId: string, payload: unknown) {
+  private onMinigameInput(playerId: string, payload: unknown) {
     const mg = this.data.state.minigame;
     if (!mg || mg.status !== "live" || this.data.state.phase !== "tiebreaker-play") return;
     const players = this.data.state.players;
@@ -664,55 +655,133 @@ class BuzzerServer implements Party.Server {
     }
   }
 
-  onPlayAgain() {
+  private onPlayAgain() {
     if (this.data.state.phase !== "final") return;
     this.clearTimers();
     for (const id of Object.keys(this.data.playersById)) {
       this.data.playersById[id].score = 0;
     }
-    this.data.state.players = Object.values(this.data.playersById).filter((p) => p.connected);
     this.data.state = makeLobbyState(this.data.state.hostId, this.data.state.settings);
     this.data.state.players = Object.values(this.data.playersById).filter((p) => p.connected);
     this.data.photos = [];
     this.broadcast();
   }
 
-  onConnect(conn: Party.Connection) {
-    const payload = { ...this.data.state, photos: this.data.photos };
-    conn.send(JSON.stringify({ type: "state", state: payload, youId: "" }));
+  private addPlayer(ws: WebSocket, name: string, isHost: boolean) {
+    const meta = (ws.deserializeAttachment() as ConnMeta | null) ?? { playerId: null, isHost: false };
+    if (meta.playerId) return;
+    if (!isHost && this.data.state.phase !== "lobby") {
+      this.sendError(ws, "Game already in progress");
+      return;
+    }
+    const trimmed = (name || (isHost ? "Host" : "Player")).trim().slice(0, 16) || "Player";
+    const id = `p${++this.data.playerIdCounter}`;
+    const takenColors = new Set(Object.values(this.data.playersById).map((p) => p.color));
+    const color = PLAYER_COLORS.find((c) => !takenColors.has(c)) ?? PLAYER_COLORS[0];
+    const player: Player = {
+      id,
+      name: trimmed,
+      score: 0,
+      color,
+      isHost,
+      connected: true,
+    };
+    this.data.playersById[id] = player;
+    ws.serializeAttachment({ playerId: id, isHost } satisfies ConnMeta);
+    if (isHost && !this.data.state.hostId) {
+      this.data.state.hostId = id;
+    }
+    if (this.data.state.phase === "lobby") {
+      this.data.state.players = Object.values(this.data.playersById).filter((p) => p.connected);
+    }
   }
 
-  onClose(conn: Party.Connection) {
-    this.removePlayer(conn);
-    this.broadcast();
+  private removePlayer(playerId: string) {
+    const player = this.data.playersById[playerId];
+    if (!player) return;
+    player.connected = false;
+    if (this.data.state.phase === "lobby") {
+      this.data.state.players = Object.values(this.data.playersById).filter((p) => p.connected);
+    }
   }
 
-  async onMessage(message: string, sender: Party.Connection) {
+  private async startGame(settingsOverride?: GameSettings, photosOverride?: PhotoEntry[]) {
+    if (this.data.state.phase !== "lobby") return;
+    if (this.playerCount() < 2) {
+      this.broadcastError("Need 2 players to start");
+      return;
+    }
+    // Atomic phase transition — protects against double-start (and persists across DO eviction)
+    if (await this.state.storage.get<boolean>("starting")) return;
+    await this.state.storage.put("starting", true);
+    this.clearTimers();
+    if (settingsOverride) {
+      this.data.state.settings = { ...defaultSettings(), ...settingsOverride };
+      await this.state.storage.put("settings", { settings: this.data.state.settings });
+    }
+    this.data.photos = (photosOverride ?? []).filter(
+      (p) => p && p.dataUrl && (p.where || p.when)
+    );
+    const settings = this.data.state.settings;
+    try {
+      const questions = await this.fetchQuestionsForRound(1, settings);
+      this.data.questionsRef.round1 = questions;
+      this.data.questionsRef.round2 = await this.fetchQuestionsForRound(2, settings);
+      this.data.state.questions = questions;
+      this.data.state.currentQuestion = 0;
+      this.data.state.round = 1;
+      this.data.state.lastEvent = null;
+      this.setState({ phase: "round1-question", buzz: this.newBuzz() });
+      this.broadcast();
+      this.queueTimer(() => this.onTimerExpire(), ROUND1_SECONDS * 1000);
+    } catch (err) {
+      this.broadcastError(`Trivia fetch failed: ${(err as Error).message}`);
+    } finally {
+      await this.state.storage.delete("starting");
+    }
+  }
+
+  async fetch(request: Request): Promise<Response> {
+    if (request.headers.get("Upgrade")?.toLowerCase() !== "websocket") {
+      return new Response("OK", { status: 200 });
+    }
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    this.state.acceptWebSocket(server);
+    server.serializeAttachment({ playerId: null, isHost: false } satisfies ConnMeta);
+    this.sendTo(server, { type: "state", state: this.publicState(), youId: "" });
+    return new Response(null, { status: 101, webSocket: client });
+  }
+
+  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
+    const meta = (ws.deserializeAttachment() as ConnMeta | null) ?? { playerId: null, isHost: false };
     let msg: ClientMessage;
     try {
-      msg = JSON.parse(message) as ClientMessage;
+      const raw = typeof message === "string" ? message : new TextDecoder().decode(message);
+      msg = JSON.parse(raw) as ClientMessage;
     } catch {
       return;
     }
     switch (msg.type) {
       case "host-join":
-        if (this.data.state.hostId && this.data.state.hostId !== this.data.connToPlayer[sender.id]) {
-          sender.send(JSON.stringify({ type: "error", message: "Host already present" }));
+        if (this.data.state.hostId && this.data.state.hostId !== meta.playerId) {
+          this.sendError(ws, "Host already present");
           return;
         }
-        this.addPlayer(sender, msg.name, true);
+        this.addPlayer(ws, msg.name, true);
         this.broadcast();
         return;
       case "player-join":
-        this.addPlayer(sender, msg.name, false);
+        this.addPlayer(ws, msg.name, false);
         this.broadcast();
         return;
       case "start-game":
-        if (this.data.connToPlayer[sender.id] !== this.data.state.hostId) return;
+        if (meta.playerId !== this.data.state.hostId) return;
         await this.startGame(msg.settings, msg.photos);
         return;
       case "next-question":
-        if (this.data.connToPlayer[sender.id] !== this.data.state.hostId) return;
+        if (meta.playerId !== this.data.state.hostId) return;
         if (this.data.state.phase === "round1-reveal") this.nextRound1Question();
         else if (this.data.state.phase === "round2-reveal") this.nextRound2Question();
         else if (this.data.state.phase === "round2-wager") this.beginRound2Question();
@@ -720,56 +789,49 @@ class BuzzerServer implements Party.Server {
         else if (this.data.state.phase === "round3-reveal") this.onRound3Next();
         else if (this.data.state.phase === "tiebreaker-intro") this.startTiebreaker();
         return;
-      case "buzz": {
-        const pid = this.data.connToPlayer[sender.id];
-        if (!pid) return;
-        this.onBuzz(pid);
+      case "buzz":
+        if (meta.playerId) this.onBuzz(meta.playerId);
         return;
-      }
-      case "answer": {
-        const pid = this.data.connToPlayer[sender.id];
-        if (!pid) return;
-        this.onAnswer(pid, msg.correct);
+      case "answer":
+        if (meta.playerId) this.onAnswer(meta.playerId, msg.correct);
         return;
-      }
-      case "set-wager": {
-        const pid = this.data.connToPlayer[sender.id];
-        if (!pid) return;
-        this.onSetWager(pid, msg.amount);
+      case "set-wager":
+        if (meta.playerId) this.onSetWager(meta.playerId, msg.amount);
         return;
-      }
       case "play-again":
-        if (this.data.connToPlayer[sender.id] !== this.data.state.hostId) return;
+        if (meta.playerId !== this.data.state.hostId) return;
         this.onPlayAgain();
         return;
       case "minigame-start":
-        if (this.data.connToPlayer[sender.id] !== this.data.state.hostId) return;
+        if (meta.playerId !== this.data.state.hostId) return;
         this.startTiebreaker();
         return;
-      case "minigame-input": {
-        const pid = this.data.connToPlayer[sender.id];
-        if (!pid) return;
-        this.onMinigameInput(pid, msg.payload);
+      case "minigame-input":
+        if (meta.playerId) this.onMinigameInput(meta.playerId, msg.payload);
         return;
-      }
-      case "round3-guess": {
-        const pid = this.data.connToPlayer[sender.id];
-        if (!pid) return;
-        this.onRound3Guess(pid, msg.where, msg.when);
+      case "round3-guess":
+        if (meta.playerId) this.onRound3Guess(meta.playerId, msg.where, msg.when);
         return;
-      }
-      case "round3-self-score": {
-        const pid = this.data.connToPlayer[sender.id];
-        if (!pid) return;
-        this.onRound3SelfScore(pid, msg.where, msg.when);
+      case "round3-self-score":
+        if (meta.playerId) this.onRound3SelfScore(meta.playerId, msg.where, msg.when);
         return;
-      }
-      case "round3-next": {
-        if (this.data.connToPlayer[sender.id] !== this.data.state.hostId) return;
+      case "round3-next":
+        if (meta.playerId !== this.data.state.hostId) return;
         this.onRound3Next();
         return;
-      }
     }
+  }
+
+  async webSocketClose(ws: WebSocket, _code: number, _reason: string, _wasClean: boolean) {
+    const meta = (ws.deserializeAttachment() as ConnMeta | null) ?? { playerId: null, isHost: false };
+    if (meta.playerId) this.removePlayer(meta.playerId);
+    this.broadcast();
+  }
+
+  async webSocketError(ws: WebSocket, _err: unknown) {
+    try {
+      ws.close(1011, "error");
+    } catch {}
   }
 }
 
@@ -808,174 +870,13 @@ function pickRandomMinigame(): MinigameState {
   };
 }
 
-async function fetchOpenTdb(count: number, difficulty: string): Promise<Question[]> {
-  const url = `https://opentdb.com/api.php?amount=${count}&difficulty=${difficulty}&type=multiple&encode=url3986`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`OpenTDB ${res.status}`);
-  const data = (await res.json()) as { response_code: number; results: Array<{ category: string; question: string; correct_answer: string; incorrect_answers: string[] }> };
-  if (data.response_code !== 0) throw new Error(`OpenTDB code ${data.response_code}`);
-  return data.results.map((r, i) => {
-    const correct = decode(decodeURIComponent(r.correct_answer));
-    const incorrects = r.incorrect_answers.map((a) => decode(decodeURIComponent(a)));
-    const options = shuffle([correct, ...incorrects]);
-    return {
-      id: `otdb-${i}-${Math.random().toString(36).slice(2, 6)}`,
-      prompt: decode(decodeURIComponent(r.question)),
-      options,
-      correctIndex: options.indexOf(correct),
-      category: decode(decodeURIComponent(r.category)),
-      source: "opentdb" as const,
-    };
-  });
-}
-
-function decode(s: string): string {
-  return s
-    .replace(/&quot;/g, '"')
-    .replace(/&#039;/g, "'")
-    .replace(/&amp;/g, "&")
-    .replace(/&eacute;/g, "é")
-    .replace(/&Eacute;/g, "É")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">");
-}
-
-export { BuzzerServer };
-
 function parseRoomId(url: URL): string | null {
   const m = url.pathname.match(/^\/parties\/[^/]+\/([A-Za-z0-9_-]+)/);
   return m?.[1] ?? null;
 }
 
-// Wrap a PartyKit-style server in a Durable Object that exposes fetch().
-class PartyDurable {
-  private state: DurableObjectState;
-  private env: Record<string, unknown>;
-  private inner: BuzzerServer;
-  private connByWs = new WeakMap<WebSocket, Party.Connection>();
-  private messagesBound = new Set<WebSocket>();
-  private partyRoom: Party.Room;
-
-  constructor(state: DurableObjectState, env: Record<string, unknown>) {
-    this.state = state;
-    this.env = env;
-    const roomId = state.id.toString();
-    const doState = this.state;
-    const self = this;
-    this.partyRoom = {
-      get id() {
-        return roomId;
-      },
-      internalID: roomId,
-      name: "main",
-      env: {},
-      storage: state.storage,
-      blockConcurrencyWhile: state.blockConcurrencyWhile?.bind(state) ?? (async () => {}),
-      broadcast: (msg: string) => {
-        for (const ws of doState.getWebSockets()) {
-          try {
-            ws.send(msg);
-          } catch {}
-        }
-      },
-      getConnection: () => undefined,
-      getConnections: function* (this: PartyDurable) {
-        for (const ws of doState.getWebSockets()) yield self.wrap(ws);
-      }.bind(self) as Party.Room["getConnections"],
-      analytics: { writeDataPoint: () => {} },
-      context: { parties: {}, vectorize: {}, ai: {}, assets: { fetch: async () => null }, bindings: { r2: {}, kv: {} } },
-    } as unknown as Party.Room;
-    this.inner = new BuzzerServer(this.partyRoom);
-  }
-
-  private wrap(ws: WebSocket): Party.Connection {
-    let existing = this.connByWs.get(ws);
-    if (existing) return existing;
-    const connId = (ws as unknown as { _pkId?: string })._pkId ?? `${this.state.id}-${Math.random().toString(36).slice(2, 8)}`;
-    (ws as unknown as { _pkId?: string })._pkId = connId;
-    const conn = Object.assign(ws, {
-      id: connId,
-      socket: ws,
-      uri: "",
-      state: null,
-      setState: function (s: unknown) {
-        (this as unknown as { state: unknown }).state = s;
-        return s;
-      },
-    }) as unknown as Party.Connection;
-    this.connByWs.set(ws, conn);
-    return conn;
-  }
-
-  async fetch(request: Request): Promise<Response> {
-    const url = new URL(request.url);
-    // Strip the leading /parties/main/<room> prefix
-    const m = url.pathname.match(/^\/parties\/[^/]+\/[^/]+(\/.*)?$/);
-    const innerPath = m?.[1] ?? "";
-    if (request.headers.get("upgrade")?.toLowerCase() === "websocket") {
-      const pair = new WebSocketPair();
-      const [client, server] = [pair[0], pair[1]];
-      const conn = this.wrap(server);
-      this.state.acceptWebSocket(server);
-      const tags = (this.inner as unknown as { getConnectionTags?: (c: Party.Connection, ctx: { request: Request }) => string[] | Promise<string[]> }).getConnectionTags;
-      if (typeof tags === "function") {
-        try {
-          await tags.call(this.inner, conn, { request });
-        } catch {}
-      }
-      if (typeof this.inner.onConnect === "function") {
-        try {
-          await this.inner.onConnect(conn, { request });
-        } catch (err) {
-          console.error("onConnect error", err);
-        }
-      }
-      // WS message/close handling is done via the webSocketMessage/webSocketClose
-      // methods on this Durable Object class — don't add manual listeners here
-      // because acceptWebSocket owns the lifecycle.
-      return new Response(null, { status: 101, webSocket: client });
-    }
-    // HTTP — delegate to onRequest
-    if (typeof this.inner.onRequest === "function") {
-      const innerUrl = new URL(innerPath + url.search, url.origin);
-      const innerReq = new Request(innerUrl.toString(), request);
-      return await this.inner.onRequest(innerReq);
-    }
-    return new Response("OK", { status: 200 });
-  }
-
-  async webSocketMessage(ws: WebSocket, message: string | ArrayBuffer) {
-    const conn = this.wrap(ws);
-    if (typeof this.inner.onMessage === "function") {
-      try {
-        await this.inner.onMessage(message, conn);
-      } catch (err) {
-        console.error("onMessage error", err);
-      }
-    }
-  }
-
-  async webSocketClose(ws: WebSocket, code: number, _reason: string, _wasClean: boolean) {
-    const conn = this.wrap(ws);
-    if (typeof this.inner.onClose === "function") {
-      try {
-        await this.inner.onClose(conn);
-      } catch (err) {
-        console.error("onClose error", err);
-      }
-    }
-  }
-
-  async webSocketError(ws: WebSocket, error: unknown) {
-    const conn = this.wrap(ws);
-    if (typeof this.inner.onError === "function") {
-      await this.inner.onError(conn, error as Error);
-    }
-  }
-}
-
-const defaultExport = {
-  async fetch(request: Request, env: { PARTYKIT_DURABLE: DurableObjectNamespace }, ctx: ExecutionContext): Promise<Response> {
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
     const roomId = parseRoomId(url);
     if (!roomId) {
@@ -986,6 +887,3 @@ const defaultExport = {
     return stub.fetch(request);
   },
 };
-
-export default defaultExport;
-export { PartyDurable };

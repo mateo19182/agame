@@ -5,8 +5,8 @@ A trivia + minigame game for two, designed to play on the couch. One laptop/TV s
 ## Stack
 
 - **Next.js 16** (App Router, React 19, TypeScript, Tailwind 4)
-- **PartyKit** for realtime (websockets, game state, timers)
-- **Open Trivia DB** for general trivia
+- **Cloudflare Workers + Durable Objects** for realtime (native WebSockets, game state, timers)
+- **Open Trivia DB** for general trivia (cached in the Worker's Cache API)
 - Hand-written `"Us"` pack for personal questions
 - Local storage for settings + photos
 - HMAC-signed cookie auth gate (Next.js Edge middleware)
@@ -15,7 +15,7 @@ A trivia + minigame game for two, designed to play on the couch. One laptop/TV s
 
 ```bash
 pnpm install
-pnpm dev          # starts Next.js (3000) + PartyKit (1999) in parallel
+pnpm dev          # starts Next.js (3000) + party worker (1999) in parallel
 ```
 
 Open `http://localhost:3000`:
@@ -37,24 +37,25 @@ All routes except `/login` require a valid auth cookie. The cookie is a HMAC-SHA
 
 | Where | What | Notes |
 | --- | --- | --- |
-| Production (`wrangler.jsonc`) | `vars.APP_PASSWORD` | Currently set to `letmein` — change this! |
+| Production secret | `APP_PASSWORD` | Set with `wrangler secret put APP_PASSWORD` (encrypted in Cloudflare's vault, not visible in source) |
 | Local dev (`.dev.vars`) | `APP_PASSWORD=...` | Read by `next dev` |
 | Fallback | `"letmein"` | Only used in dev (`NODE_ENV !== "production"`) when no env var is set. Throws in production. |
 
-To change the production password:
+To set the production password:
 
 ```bash
-# Edit wrangler.jsonc's vars.APP_PASSWORD, then redeploy:
+pnpm exec wrangler secret put APP_PASSWORD --config wrangler.jsonc
+# then redeploy:
 pnpm exec wrangler deploy --config wrangler.jsonc
 ```
 
-For an extra-secret password, use `wrangler secret put APP_PASSWORD` instead of putting it in the config file (then the value is encrypted in Cloudflare's vault and not visible in source).
+The password is no longer stored in `wrangler.jsonc` as a `vars` entry — it must be a secret.
 
 ### WebSocket endpoint
 
 The party server at `agame-party.mateoamadoares.workers.dev` is **not** auth-gated at the network layer. The de-facto protection is that room codes are 4 random letters from a 24-letter alphabet (~330k possibilities), and you can't start a game without two players. Knowing a code requires being in the gate.
 
-If you need stricter WS auth (e.g. per-user tokens), see the comments in `party/main.ts` about adding a token check in `onConnect`.
+If you need stricter WS auth (e.g. per-user tokens), add a token check in the `webSocketMessage` handler in `party/main.ts:559` (reject `host-join` / `player-join` if the cookie/JWT is missing).
 
 ## Game flow (~6–8 minutes)
 
@@ -101,7 +102,7 @@ To customize the "Us" question pack, edit `src/lib/usQuestions.ts`.
 
 ```
 party/
-  main.ts              # PartyKit game server (state machine, timers, scoring)
+  main.ts              # Cloudflare Durable Object (state machine, timers, scoring, hibernation)
 src/
   app/
     page.tsx           # Landing — Create / Join
@@ -112,17 +113,17 @@ src/
     GameView.tsx       # Big phase-routing component
   lib/
     game.ts            # Types, state shape, client messages
-    trivia.ts          # OpenTDB fetcher (server side)
+    trivia.ts          # OpenTDB fetcher (server side, unused at runtime)
     usQuestions.ts     # Hand-written personal pack
-    useRoom.ts         # PartySocket client hook
+    useRoom.ts         # Native WebSocket client hook
     useNow.ts          # Timer tick hook
     sounds.ts          # WebAudio sound effects
-partykit.json
+wrangler.party.toml    # DO worker config (Cloudflare-native)
 ```
 
 ## Deploying
 
-This project is deployed to Cloudflare, with the party server as a Cloudflare Worker (DOs) and the Next.js web app as another Worker via OpenNext.
+This project is deployed to Cloudflare, with the party server as a Cloudflare Worker running Durable Objects and the Next.js web app as another Worker via OpenNext.
 
 ### Architecture
 
@@ -133,9 +134,9 @@ This project is deployed to Cloudflare, with the party server as a Cloudflare Wo
 
 The web build inlines `NEXT_PUBLIC_PARTYKIT_HOST=agame-party.mateoamadoares.workers.dev` via `.env.production`, so phones opening `magame.m19182.dev/play/<code>` know where to WebSocket-connect.
 
-### Why not `partykit deploy`?
+### Why direct `wrangler deploy` instead of `partykit deploy`?
 
-The PartyKit managed deploy (`partykit deploy`) hits Cloudflare's hard limit of 10,000 custom subdomains on the shared `partykit.dev` zone — a platform-wide cap. The workaround is to deploy the DO-based party server directly to your own Cloudflare account via `wrangler deploy`, which we do here.
+`partykit deploy` ships to Cloudflare's shared `partykit.dev` zone, which is capped at 10,000 custom subdomains. We avoid that by deploying the DO worker straight to our own account via `wrangler deploy`. The party server is a single `GameRoom` class extending `DurableObject` (see `party/main.ts:136`) using the native `state.acceptWebSocket()` WebSocket Hibernation API — no PartyKit runtime required.
 
 ### One-time setup
 
@@ -155,13 +156,16 @@ export CLOUDFLARE_API_TOKEN=...
 ### Deploy the party server
 
 ```bash
-pnpm exec wrangler deploy --config wrangler.party.toml
+pnpm run deploy:party
+# i.e. wrangler deploy --config wrangler.party.toml
 ```
 
-This ships the DO class (`PartyDurable`) which wraps the `BuzzerServer` game logic. `wrangler.party.toml` declares:
-- The DO migration (`v2: new_sqlite_classes = ["PartyDurable"]`)
+This ships the `GameRoom` DO class. `wrangler.party.toml` declares:
+- The DO migration (`v1: new_sqlite_classes = ["GameRoom"]`)
 - The `PARTYKIT_DURABLE` binding to that class
 - The party room URL in `vars.PARTYKIT_HOST`
+
+> **Note:** if you have an older deployment using the `PartyDurable` class (pre-refactor), the `v1` migration here will conflict. Either delete the existing DO namespace from the Cloudflare dashboard first, or restore the old `v2` migration above `v1` to keep history linear.
 
 For a custom domain, also create a Worker Route:
 
@@ -176,14 +180,17 @@ curl -X POST https://api.cloudflare.com/client/v4/zones/<zone_id>/workers/routes
 ### Deploy the web
 
 ```bash
-# 1. Build with the right NEXT_PUBLIC_PARTYKIT_HOST (inlined into the client bundle)
+# 1. Set the APP_PASSWORD secret (one time, then re-run after rotations)
+pnpm exec wrangler secret put APP_PASSWORD --config wrangler.jsonc
+
+# 2. Build with the right NEXT_PUBLIC_PARTYKIT_HOST (inlined into the client bundle)
 #    This is set via .env.production
 pnpm exec opennextjs-cloudflare build
 
-# 2. Deploy the resulting Worker
+# 3. Deploy the resulting Worker
 pnpm exec wrangler deploy --config wrangler.jsonc
 
-# 3. For a custom domain, add a Worker Route
+# 4. For a custom domain, add a Worker Route
 curl -X POST https://api.cloudflare.com/client/v4/zones/<zone_id>/workers/routes \
   -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
   -d '{"pattern":"<web-domain>/*","script":"agame-web"}'
@@ -195,13 +202,16 @@ curl -X POST https://api.cloudflare.com/client/v4/zones/<zone_id>/workers/routes
 pnpm dev
 ```
 
-Uses concurrently to run Next.js (3000) + a local `partykit dev` server (1999) for fast iteration without touching Cloudflare.
+Uses concurrently to run Next.js (3000) + `wrangler dev` for the party worker (1999) for fast iteration without touching Cloudflare. The party worker uses local DO persistence automatically.
 
 ## Scripts
 
 - `pnpm dev` — both servers (concurrently)
 - `pnpm dev:next` — Next.js only
-- `pnpm dev:party` — PartyKit only
+- `pnpm dev:party` — `wrangler dev` for the party worker (port 1999)
 - `pnpm build` — production build (standard Next.js)
 - `pnpm lint` — eslint
 - `pnpm start` — production server
+- `pnpm deploy` — OpenNext build + wrangler deploy for the web
+- `pnpm deploy:party` — wrangler deploy for the party worker
+- `pnpm cf-typegen` — generate `worker-configuration.d.ts`
