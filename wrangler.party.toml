@@ -1,0 +1,18 @@
+name = "agame-party"
+compatibility_date = "2024-09-01"
+main = "./party/main.ts"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["BuzzerServer"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["PartyDurable"]
+
+[[durable_objects.bindings]]
+name = "PARTYKIT_DURABLE"
+class_name = "PartyDurable"
+
+[vars]
+PARTYKIT_HOST = "agame-party.mateoamadoares.workers.dev"
