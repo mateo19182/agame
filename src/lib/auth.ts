@@ -1,17 +1,26 @@
 // Shared constants for the auth gate. Safe for both Edge and Node runtimes.
+import { getCloudflareContext } from "@opennextjs/cloudflare";
+
 export const AUTH_COOKIE_NAME = "agame_auth";
 export const SIGNED_MSG = "agame-auth-v1";
 export const COOKIE_MAX_AGE = 60 * 60 * 24 * 30; // 30 days
 
 function getPassword(): string {
-  const pwd = process.env.APP_PASSWORD;
-  if (!pwd) {
-    if (process.env.NODE_ENV === "production") {
-      throw new Error("APP_PASSWORD env var is required in production");
-    }
-    return "letmein";
+  // Cloudflare runtime env (secrets + vars) — works in production
+  try {
+    const ctx = getCloudflareContext();
+    const pwd = ctx?.env?.APP_PASSWORD;
+    if (typeof pwd === "string" && pwd.length > 0) return pwd;
+  } catch {
+    // getCloudflareContext can throw outside a request context
   }
-  return pwd;
+  // Build-time inlined env — works in `next dev` where .env / .dev.vars are loaded
+  const pwd = process.env.APP_PASSWORD;
+  if (pwd) return pwd;
+  if (process.env.NODE_ENV === "production") {
+    throw new Error("APP_PASSWORD env var is required in production");
+  }
+  return "letmein";
 }
 
 function bytesToHex(bytes: Uint8Array): string {
@@ -42,6 +51,11 @@ export async function signAuthCookie(cookieValue?: string): Promise<string | und
   );
   const sig = await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(SIGNED_MSG));
   return bytesToHex(new Uint8Array(sig));
+}
+
+export async function verifyPasswordAndSign(submitted: string): Promise<string | null> {
+  if (!constantTimeEqualString(submitted, getPassword())) return null;
+  return (await signAuthCookie(submitted)) ?? null;
 }
 
 export async function checkAuth(cookieValue: string | undefined): Promise<boolean> {

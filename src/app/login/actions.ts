@@ -2,17 +2,13 @@
 
 import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { AUTH_COOKIE_NAME, COOKIE_MAX_AGE, constantTimeEqualString, signAuthCookie } from "@/lib/auth";
+import { AUTH_COOKIE_NAME, COOKIE_MAX_AGE, verifyPasswordAndSign } from "@/lib/auth";
 
 export async function loginAction(formData: FormData) {
   const submitted = (formData.get("password") as string | null) ?? "";
-  const expected = process.env.APP_PASSWORD ?? (process.env.NODE_ENV === "production" ? "" : "letmein");
-  if (!constantTimeEqualString(submitted, expected)) {
-    return { error: "Wrong password" };
-  }
-  const signature = await signAuthCookie(submitted);
+  const signature = await verifyPasswordAndSign(submitted);
   if (!signature) {
-    return { error: "Server misconfigured" };
+    return { error: "Wrong password" };
   }
   const cookieStore = await cookies();
   cookieStore.set(AUTH_COOKIE_NAME, signature, {
