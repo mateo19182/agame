@@ -1,11 +1,13 @@
-# Buzzer Battle
+# magame
 
-A trivia + minigame game for two, designed to play on the couch. One laptop/TV shows the board, two phones become the buzzers. **Password-gated** so only people you tell the password to can play.
+A couch game for two — trivia duels and quick minigames, played on the big screen with two phones as controllers. **Password-gated** so only people you tell the password to can play.
+
+The name is short for "mateo-ainhoa game". One laptop/TV shows the board, two phones join with a 4-letter room code.
 
 ## Stack
 
 - **Next.js 16** (App Router, React 19, TypeScript, Tailwind 4)
-- **Cloudflare Workers + Durable Objects** for realtime (native WebSockets, game state, timers)
+- **Cloudflare Workers + Durable Objects** for realtime (native WebSockets, game state, timers, hibernation)
 - **Open Trivia DB** for general trivia (cached in the Worker's Cache API)
 - Hand-written `"Us"` pack for personal questions
 - Local storage for settings + photos
@@ -23,7 +25,31 @@ Open `http://localhost:3000`:
 - You'll be redirected to `/login`. **Default password: `letmein`**
 - After login, click **Host a game** (creates a 4-letter code) or **Join a game** (enter the code on a phone)
 
-The two devices see the same game in realtime. The host's screen shows the board, the phones show big buzz buttons. **Sign out** link in the corner clears the cookie.
+The two devices see the same game in realtime. The host's screen shows the board, the phones show the controller (buzz button for trivia, etc.). **Sign out** link in the corner clears the cookie.
+
+## How a match works
+
+A match is a sequence of **minigames**. Each match is `matchLength` rounds long (host chooses in the lobby, default 4). At the end of each round the host moves to the next minigame; the picker avoids any minigame that's already been played unless `allowRepeats` is on.
+
+The five minigames, all configurable in `/settings`:
+
+| Minigame | What you do | Scoring |
+| --- | --- | --- |
+| **Trivia** | Buzz in and answer (optionally with wagers) | +1 per correct (rapid), or +wager (wager mode), −wager on wrong |
+| **Memory Lane** | Your own photos: guess where & when, then self-score | +1 where, +1 when (self-scored) |
+| **Reflex Tap** | Wait for green light, then mash | +1 to whoever taps more |
+| **Speed Sort** | Sort fruits and veggies into the right bins | +1 to whoever finishes first |
+| **Type Race** | Type the phrase as fast as you can | +1 to whoever finishes first |
+
+Flow per match:
+
+1. **Lobby** — both players join, host picks which minigames to include + how many rounds + whether repeats are allowed
+2. **Minigame intro** — host sees the next minigame's name, taps Begin
+3. **Minigame active** — the per-minigame UI plays out (buzzing / photo guessing / tapping / sorting / typing)
+4. **Minigame end** — score deltas shown for one beat, then auto-advance
+5. After `matchLength` minigames → **Final**, play again
+
+If the host skips a minigame or a trivia fetch fails, the round is recorded and we move to the next pick.
 
 ## Auth gate
 
@@ -55,48 +81,23 @@ The password is no longer stored in `wrangler.jsonc` as a `vars` entry — it mu
 
 The party server at `agame-party.mateoamadoares.workers.dev` is **not** auth-gated at the network layer. The de-facto protection is that room codes are 4 random letters from a 24-letter alphabet (~330k possibilities), and you can't start a game without two players. Knowing a code requires being in the gate.
 
-If you need stricter WS auth (e.g. per-user tokens), add a token check in the `webSocketMessage` handler in `party/main.ts:559` (reject `host-join` / `player-join` if the cookie/JWT is missing).
-
-## Game flow (~6–8 minutes)
-
-1. **Lobby** — both players join, host taps "Start"
-2. **Round 1: Rapid Fire** — 8 trivia questions. First to buzz answers, wrong answer lets the other steal
-3. **Round 2: Wagers** — 3 questions. Each player secretly wagers 0–N points, then buzzer applies
-4. **Round 3: Memory Lane** *(only if you uploaded photos in /settings)* — both players see each photo, type where & when, then truth reveals and you self-score
-5. **Tiebreaker** (if still tied) — random minigame:
-   - **Reflex Tap** — wait for green light, mash your button
-   - **Speed Sort** — sort fruits/veggies into bins
-   - **Type Race** — type the phrase fastest
-6. **Final** — winner crowned, play again
-
-## Memory Lane (Round 3)
-
-A personal minigame using your own photos. To set it up:
-
-1. Open `/settings` on the host's laptop
-2. In the **Memory Lane** section, drag-and-drop (or tap to upload) photos
-3. For each photo, fill in **Where was this?** and **When?** (the truth)
-4. Photos are saved in your browser's localStorage
-5. When the host starts a game, photos get sent to the room and Round 3 plays after Round 2
-
-During the round: both players see each photo, type their guess, then the truth reveals and each player self-scores their where/when as ✅ or ✗ (1 point per correct).
-
-If no photos are uploaded, Round 3 is skipped entirely.
+If you need stricter WS auth (e.g. per-user tokens), add a token check in the `webSocketMessage` handler in `party/main.ts` (reject `host-join` / `player-join` if the cookie/JWT is missing).
 
 ## Settings
 
-`/` → Settings lets you pick:
+`/settings` shows one card per minigame with the knobs that affect how it plays. Photos for Memory Lane are uploaded and annotated here. There's also a "Match defaults" section for `matchLength` and `allowRepeats`, which the lobby can override per match.
 
-- **Pack**: General (OpenTDB) · "Us" (hand-written) · Mixed
-- **Difficulty**: easy/medium/hard (general trivia only)
-- **Round 1 questions**: 5, 6, 8, 10, 12
-- **Round 2 questions**: 1, 2, 3, 5
-- **Tiebreaker**: play a minigame if scores tie
-- **Memory Lane**: upload + annotate your photos
-
-Settings are saved in `localStorage` and sent with each game.
+Settings are saved in `localStorage` (`agame:v2:settings`) and sent with each game.
 
 To customize the "Us" question pack, edit `src/lib/usQuestions.ts`.
+
+### Per-minigame fields
+
+- **Trivia** — pack (general / "Us" / mixed), difficulty (general only), question count (5/6/8/10/12), use wagers
+- **Memory Lane** — photo upload + where/when annotations (drag-and-drop or tap to upload)
+- **Reflex Tap** — tap window after green, light delay min/max
+- **Speed Sort** — item count (2/4/6/8)
+- **Type Race** — prompt variety
 
 ## Project layout
 
@@ -107,19 +108,25 @@ src/
   app/
     page.tsx           # Landing — Create / Join
     host/[code]/       # Host screen (laptop/TV)
-    play/[code]/       # Phone player (buzzer)
+    play/[code]/       # Phone player (controller)
     settings/          # Settings page
   components/
     GameView.tsx       # Big phase-routing component
   lib/
-    game.ts            # Types, state shape, client messages
-    trivia.ts          # OpenTDB fetcher (server side, unused at runtime)
+    game.ts            # Types, state shape, client messages, defaults
+    photos.ts          # Image → JPEG data-URL resizer
     usQuestions.ts     # Hand-written personal pack
     useRoom.ts         # Native WebSocket client hook
     useNow.ts          # Timer tick hook
     sounds.ts          # WebAudio sound effects
+    auth.ts            # HMAC auth helpers
 wrangler.party.toml    # DO worker config (Cloudflare-native)
 ```
+
+The state machine lives in `party/main.ts:GameRoom`. Key entry points:
+- `pickNextMinigame(state)` — chooses the next minigame honoring `matchLength` + `allowRepeats`
+- `startActiveMinigame()` — initializes the chosen minigame's state and schedules its first alarm
+- `endMinigame()` — computes score deltas and transitions to `minigame-end`
 
 ## Deploying
 
@@ -136,7 +143,7 @@ The web build inlines `NEXT_PUBLIC_PARTYKIT_HOST=agame-party.mateoamadoares.work
 
 ### Why direct `wrangler deploy` instead of `partykit deploy`?
 
-`partykit deploy` ships to Cloudflare's shared `partykit.dev` zone, which is capped at 10,000 custom subdomains. We avoid that by deploying the DO worker straight to our own account via `wrangler deploy`. The party server is a single `GameRoom` class extending `DurableObject` (see `party/main.ts:136`) using the native `state.acceptWebSocket()` WebSocket Hibernation API — no PartyKit runtime required.
+`partykit deploy` ships to Cloudflare's shared `partykit.dev` zone, which is capped at 10,000 custom subdomains. We avoid that by deploying the DO worker straight to our own account via `wrangler deploy`. The party server is a single `GameRoom` class extending `DurableObject` (see `party/main.ts:GameRoom`) using the native `state.acceptWebSocket()` WebSocket Hibernation API — no PartyKit runtime required.
 
 ### One-time setup
 
@@ -146,12 +153,7 @@ The web build inlines `NEXT_PUBLIC_PARTYKIT_HOST=agame-party.mateoamadoares.work
 2. CF API token with `Edit Cloudflare Workers` scope (`Account → Profile → API Tokens`)
 3. The `Account ID` from the zone overview
 
-Set these as env vars before deploying:
-
-```bash
-export CLOUDFLARE_ACCOUNT_ID=...
-export CLOUDFLARE_API_TOKEN=...
-```
+Authenticate once with `pnpm exec wrangler login` (uses OAuth, no token needed for subsequent deploys).
 
 ### Deploy the party server
 
@@ -161,11 +163,9 @@ pnpm run deploy:party
 ```
 
 This ships the `GameRoom` DO class. `wrangler.party.toml` declares:
-- The DO migration (`v1: new_sqlite_classes = ["GameRoom"]`)
+- The DO migration history (final binding is `GameRoom`)
 - The `PARTYKIT_DURABLE` binding to that class
 - The party room URL in `vars.PARTYKIT_HOST`
-
-> **Note:** if you have an older deployment using the `PartyDurable` class (pre-refactor), the `v1` migration here will conflict. Either delete the existing DO namespace from the Cloudflare dashboard first, or restore the old `v2` migration above `v1` to keep history linear.
 
 For a custom domain, also create a Worker Route:
 
@@ -213,5 +213,5 @@ Uses concurrently to run Next.js (3000) + `wrangler dev` for the party worker (1
 - `pnpm lint` — eslint
 - `pnpm start` — production server
 - `pnpm deploy` — OpenNext build + wrangler deploy for the web
-- `pnpm deploy:party` — wrangler deploy for the party worker
+- `pnpm deploy:party` — wrangler deploy for the party server
 - `pnpm cf-typegen` — generate `worker-configuration.d.ts`

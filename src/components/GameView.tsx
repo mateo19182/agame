@@ -1,8 +1,18 @@
 "use client";
 
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import confetti from "canvas-confetti";
-import type { GameState } from "@/lib/game";
+import type {
+  GameState,
+  MemoryLaneState,
+  MinigameId,
+  ReflexState,
+  SpeedSortState,
+  TriviaState,
+  TypeRaceState,
+} from "@/lib/game";
+import { MINIGAME_META } from "@/lib/game";
 import { useNow } from "@/lib/useNow";
 import { sounds } from "@/lib/sounds";
 
@@ -37,38 +47,15 @@ export function GameView({ role, code, state, youId, connected, send }: Props) {
         {state.phase === "lobby" && (
           <Lobby state={state} isHost={isHost} send={send} youId={youId} />
         )}
-        {state.phase === "round1-intro" && <Round1Intro state={state} isHost={isHost} send={send} />}
-        {state.phase === "round1-question" && (
-          <QuestionView state={state} role={role} send={send} youId={youId} />
+        {state.phase === "minigame-intro" && state.currentMinigame && (
+          <MinigameIntro state={state} isHost={isHost} send={send} />
         )}
-        {state.phase === "round1-reveal" && (
-          <RevealView state={state} role={role} send={send} youId={youId} />
+        {state.phase === "minigame-active" && state.minigame && (
+          <MinigameActive state={state} role={role} send={send} youId={youId} />
         )}
-        {state.phase === "round2-wager" && (
-          <WagerView state={state} role={role} send={send} youId={youId} />
+        {state.phase === "minigame-end" && state.minigameResult && (
+          <MinigameEnd state={state} isHost={isHost} send={send} />
         )}
-        {state.phase === "round2-question" && (
-          <QuestionView state={state} role={role} send={send} youId={youId} />
-        )}
-        {state.phase === "round2-reveal" && (
-          <RevealView state={state} role={role} send={send} youId={youId} />
-        )}
-        {state.phase === "round3-intro" && (
-          <Round3Intro state={state} isHost={isHost} send={send} />
-        )}
-        {state.phase === "round3-photo" && (
-          <Round3Photo state={state} role={role} send={send} youId={youId} />
-        )}
-        {state.phase === "round3-reveal" && (
-          <Round3Reveal state={state} role={role} send={send} youId={youId} />
-        )}
-        {state.phase === "tiebreaker-intro" && (
-          <TiebreakerIntro state={state} isHost={isHost} send={send} />
-        )}
-        {state.phase === "tiebreaker-play" && (
-          <TiebreakerPlay state={state} role={role} send={send} youId={youId} />
-        )}
-        {state.phase === "tiebreaker-result" && <TiebreakerResult state={state} />}
         {state.phase === "final" && <FinalView state={state} isHost={isHost} send={send} />}
       </div>
       <ScoreBar state={state} youId={youId} />
@@ -93,50 +80,38 @@ function Header({ code, state, connected }: { code: string; state: GameState; co
 }
 
 function PhaseLabel({ state }: { state: GameState }) {
-  const map: Record<GameState["phase"], string> = {
-    lobby: "Lobby",
-    "round1-intro": "Round 1",
-    "round1-question": "Round 1",
-    "round1-reveal": "Round 1",
-    "round2-wager": "Round 2 · Wager",
-    "round2-question": "Round 2",
-    "round2-reveal": "Round 2",
-    "round3-intro": "Round 3 · Memory Lane",
-    "round3-photo": "Round 3 · Memory Lane",
-    "round3-reveal": "Round 3 · Memory Lane",
-    "tiebreaker-intro": "Tiebreaker",
-    "tiebreaker-play": "Tiebreaker",
-    "tiebreaker-result": "Tiebreaker",
-    final: "Final",
-  };
+  const id = state.currentMinigame;
+  const meta = id ? MINIGAME_META.find((m) => m.id === id) : null;
+  const label = (() => {
+    if (state.phase === "lobby") return "Lobby";
+    if (state.phase === "minigame-intro") return meta ? `Up next · ${meta.label}` : "Up next";
+    if (state.phase === "minigame-active") {
+      const turn = Math.min(state.playedCount + 1, state.settings.matchLength);
+      return meta ? `Minigame ${turn} of ${state.settings.matchLength} · ${meta.label}` : "Minigame";
+    }
+    if (state.phase === "minigame-end") return meta ? `${meta.label} · Result` : "Result";
+    if (state.phase === "final") return "Final";
+    return "";
+  })();
   return (
     <div className="hidden sm:block text-sm uppercase tracking-widest text-[color:var(--muted)]">
-      {map[state.phase]}
+      {label}
     </div>
   );
 }
 
 function ScoreBar({ state, youId }: { state: GameState; youId: string }) {
   return (
-    <div className="px-4 sm:px-6 py-3 max-w-6xl w-full mx-auto w-full">
-      <div className="glass rounded-2xl px-4 py-3 flex items-center justify-between gap-3">
-        {state.players.length === 0 && <div className="text-[color:var(--muted)] text-sm">Waiting for players…</div>}
+    <div className="px-4 sm:px-6 pb-4 max-w-6xl w-full mx-auto w-full">
+      <div className="glass rounded-2xl p-3 grid grid-cols-2 gap-3">
         {state.players.map((p) => (
-          <div
-            key={p.id}
-            className={`flex items-center gap-3 flex-1 ${p.id === youId ? "" : "opacity-90"}`}
-          >
-            <div
-              className="w-8 h-8 rounded-full grid place-items-center font-black text-black"
-              style={{ background: p.color }}
-            >
-              {p.name.slice(0, 1).toUpperCase()}
-            </div>
-            <div className="flex-1 min-w-0">
-              <div className="text-sm font-semibold truncate flex items-center gap-2">
+          <div key={p.id} className="px-3 py-2 flex items-center justify-between">
+            <div className="flex items-center gap-2 min-w-0">
+              <span className="w-2.5 h-2.5 rounded-full" style={{ background: p.color }} />
+              <span className="font-semibold truncate">
                 {p.name}
-                {p.isHost && <span className="text-[10px] uppercase tracking-widest text-[color:var(--muted)]">Host</span>}
-              </div>
+                {p.id === youId && <span className="text-[color:var(--muted)] text-xs"> · you</span>}
+              </span>
               <div className="text-xs text-[color:var(--muted)]">{p.connected ? "Connected" : "Disconnected"}</div>
             </div>
             <div className="text-2xl font-black tabular-nums">{p.score}</div>
@@ -150,15 +125,21 @@ function ScoreBar({ state, youId }: { state: GameState; youId: string }) {
 function Lobby({ state, isHost, send, youId }: { state: GameState; isHost: boolean; send: Props["send"]; youId: string }) {
   const players = state.players;
   const youAreIn = players.some((p) => p.id === youId);
+  const code = getRoomFromUrl();
+  const origin = typeof window !== "undefined" ? window.location.origin : "";
+  const fullUrl = `${origin}/play/${code}`;
   return (
     <div className="flex-1 flex flex-col items-center justify-center text-center gap-6">
       <div>
         <div className="text-sm uppercase tracking-widest text-[color:var(--accent-3)]">Open this on a phone</div>
-        <div className="mt-2 text-6xl sm:text-8xl font-black tracking-[0.3em] text-shadow-lg">{state.players.length ? "" : ""}</div>
       </div>
       <div className="glass rounded-3xl px-6 py-8 max-w-md w-full">
-        <div className="text-sm text-[color:var(--muted)]">Share this URL or just the code</div>
-        <div className="mt-2 text-3xl font-black tracking-[0.3em]">{`${typeof window !== "undefined" ? window.location.origin : ""}/play/${getRoomFromUrl()}`}</div>
+        <div className="text-sm text-[color:var(--muted)]">Room code</div>
+        <div className="mt-2 text-6xl sm:text-7xl font-black tracking-[0.2em]">{code}</div>
+        <div className="mt-4 flex items-center justify-center gap-2">
+          <div className="text-xs text-[color:var(--muted)] break-all max-w-full">{fullUrl}</div>
+          <CopyButton value={fullUrl} />
+        </div>
         <div className="mt-6 text-sm text-[color:var(--muted)]">In the room</div>
         <div className="mt-2 flex flex-wrap justify-center gap-2">
           {players.length === 0 && <div className="text-[color:var(--muted)] text-sm">No one yet</div>}
@@ -173,12 +154,7 @@ function Lobby({ state, isHost, send, youId }: { state: GameState; isHost: boole
       </div>
       {isHost ? (
         players.length >= 2 ? (
-          <button
-            onClick={() => send({ type: "start-game" })}
-            className="px-8 py-5 rounded-2xl bg-gradient-to-br from-[color:var(--accent)] to-[color:var(--accent-2)] font-black text-2xl glow-pink hover:brightness-110 active:scale-[0.98] transition"
-          >
-            Start game →
-          </button>
+          <LobbyOptions state={state} send={send} />
         ) : (
           <div className="text-[color:var(--muted)]">Waiting for at least 2 players…</div>
         )
@@ -189,36 +165,230 @@ function Lobby({ state, isHost, send, youId }: { state: GameState; isHost: boole
   );
 }
 
-function getRoomFromUrl(): string {
-  if (typeof window === "undefined") return "";
-  const m = window.location.pathname.match(/\/(host|play)\/([A-Z]{4})/);
-  return m?.[2] ?? "";
+function LobbyOptions({ state, send }: { state: GameState; send: Props["send"] }) {
+  const initialEnabled = useMemo<Record<MinigameId, boolean>>(() => {
+    const hasPhotos = state.settings.minigames["memory-lane"].photos.filter(
+      (p) => p.dataUrl && (p.where || p.when)
+    ).length > 0;
+    return {
+      trivia: true,
+      "memory-lane": hasPhotos,
+      reflex: true,
+      "speed-sort": true,
+      "type-race": true,
+    };
+  }, [state]);
+
+  const [enabled, setEnabled] = useState<Record<MinigameId, boolean>>(initialEnabled);
+  const [matchLength, setMatchLength] = useState(state.settings.matchLength);
+  const [allowRepeats, setAllowRepeats] = useState(state.settings.allowRepeats);
+
+  const enabledIds = (Object.entries(enabled) as [MinigameId, boolean][])
+    .filter(([, v]) => v)
+    .map(([k]) => k);
+  const maxMatchLength = allowRepeats ? 20 : Math.max(1, enabledIds.length);
+  const effectiveMatchLength = Math.min(matchLength, maxMatchLength);
+  const canStart = enabledIds.length > 0 && effectiveMatchLength > 0;
+
+  function start() {
+    const minigames = { ...state.settings.minigames };
+    send({
+      type: "start-game",
+      settings: {
+        minigames,
+        matchLength: effectiveMatchLength,
+        allowRepeats,
+      },
+    });
+  }
+
+  return (
+    <div className="w-full max-w-xl space-y-4">
+      <div className="glass rounded-3xl p-5 sm:p-6 text-left space-y-4">
+        <div>
+          <div className="text-xs uppercase tracking-widest text-[color:var(--muted)]">Minigames in this match</div>
+          <div className="mt-3 grid grid-cols-1 sm:grid-cols-2 gap-2">
+            {MINIGAME_META.map((m) => {
+              const checked = enabled[m.id];
+              return (
+                <button
+                  key={m.id}
+                  onClick={() => setEnabled((e) => ({ ...e, [m.id]: !e[m.id] }))}
+                  className={`w-full text-left px-3 py-2.5 rounded-2xl border transition ${checked ? "border-[color:var(--accent)] bg-[color:var(--accent)]/10" : "border-white/10 hover:border-white/20"}`}
+                >
+                  <div className="font-semibold">{m.label}</div>
+                  <div className="text-xs text-[color:var(--muted)] mt-0.5">{m.description}</div>
+                </button>
+              );
+            })}
+          </div>
+        </div>
+
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          <div>
+            <div className="text-xs uppercase tracking-widest text-[color:var(--muted)]">Rounds</div>
+            <div className="mt-2 flex items-center gap-2">
+              <button
+                onClick={() => setMatchLength((n) => Math.max(1, n - 1))}
+                className="w-9 h-9 rounded-full glass font-black"
+                aria-label="Fewer rounds"
+              >
+                −
+              </button>
+              <div className="flex-1 text-center text-2xl font-black tabular-nums">{effectiveMatchLength}</div>
+              <button
+                onClick={() => setMatchLength((n) => Math.min(maxMatchLength, n + 1))}
+                className="w-9 h-9 rounded-full glass font-black"
+                aria-label="More rounds"
+              >
+                +
+              </button>
+            </div>
+            {!allowRepeats && (
+              <div className="text-xs text-[color:var(--muted)] mt-1">
+                Capped at {maxMatchLength} (no repeats)
+              </div>
+            )}
+          </div>
+
+          <div>
+            <div className="text-xs uppercase tracking-widest text-[color:var(--muted)]">Allow repeats</div>
+            <button
+              onClick={() => setAllowRepeats((v) => !v)}
+              className="mt-2 w-full flex items-center justify-between px-4 py-3 rounded-2xl border border-white/10"
+            >
+              <span className="font-semibold">Pick a minigame twice</span>
+              <span className={`w-12 h-7 rounded-full p-1 transition ${allowRepeats ? "bg-[color:var(--accent)]" : "bg-white/10"}`}>
+                <span className={`block w-5 h-5 rounded-full bg-white transition ${allowRepeats ? "translate-x-5" : ""}`} />
+              </span>
+            </button>
+          </div>
+        </div>
+
+        <div className="text-xs text-[color:var(--muted)]">
+          Configure each minigame in <Link href="/settings" className="underline">Settings</Link>.
+        </div>
+      </div>
+
+      <button
+        onClick={start}
+        disabled={!canStart}
+        className="w-full px-8 py-5 rounded-2xl bg-gradient-to-br from-[color:var(--accent)] to-[color:var(--accent-2)] font-black text-2xl glow-pink hover:brightness-110 active:scale-[0.98] transition disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        Start game ({effectiveMatchLength} {effectiveMatchLength === 1 ? "round" : "rounds"}) →
+      </button>
+    </div>
+  );
 }
 
-function Round1Intro({ state, isHost, send }: { state: GameState; isHost: boolean; send: Props["send"] }) {
+function MinigameIntro({ state, isHost, send }: { state: GameState; isHost: boolean; send: Props["send"] }) {
+  const id = state.currentMinigame!;
+  const meta = MINIGAME_META.find((m) => m.id === id)!;
+  const turn = state.playedCount + 1;
   return (
-    <div className="flex-1 flex flex-col items-center justify-center text-center gap-6">
-      <div className="text-sm uppercase tracking-widest text-[color:var(--accent-3)]">Round 1</div>
-      <h2 className="text-4xl sm:text-6xl font-black">Rapid Fire</h2>
-      <p className="text-[color:var(--muted)] max-w-md">
-        {state.settings.round1Questions} questions. First to buzz answers. Wrong answer steals for the other player.
-      </p>
-      {isHost && (
+    <div className="flex-1 flex flex-col items-center justify-center gap-6 text-center p-4">
+      <div className="text-xs uppercase tracking-widest text-[color:var(--accent-3)]">
+        Round {turn} of {state.settings.matchLength}
+      </div>
+      <h2 className="text-4xl sm:text-6xl font-black">{meta.label}</h2>
+      <p className="text-[color:var(--muted)] max-w-md">{meta.description}</p>
+      {id === "trivia" && state.settings.minigames.trivia.useWagers && (
+        <div className="glass rounded-2xl px-4 py-2 text-sm text-[color:var(--accent-3)]">Wagers enabled</div>
+      )}
+      {isHost ? (
         <button
           onClick={() => send({ type: "next-question" })}
           className="px-8 py-5 rounded-2xl bg-gradient-to-br from-[color:var(--accent)] to-[color:var(--accent-2)] font-black text-2xl glow-pink"
         >
           Begin →
         </button>
+      ) : (
+        <div className="text-[color:var(--muted)]">Waiting for the host to start…</div>
       )}
     </div>
   );
 }
 
-function QuestionView({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
+function MinigameActive({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
+  const mg = state.minigame!;
+  if (mg.id === "trivia") return <TriviaActive state={state} role={role} send={send} youId={youId} />;
+  if (mg.id === "memory-lane") return <MemoryLaneActive state={state} role={role} send={send} youId={youId} />;
+  if (mg.id === "reflex") return <ReflexActive state={state} role={role} send={send} youId={youId} />;
+  if (mg.id === "speed-sort") return <SpeedSortActive state={state} role={role} send={send} youId={youId} />;
+  return <TypeRaceActive state={state} role={role} send={send} youId={youId} />;
+}
+
+function TriviaActive({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
+  const mg = state.minigame as TriviaState;
+  if (mg.phase === "wager") return <TriviaWagerView state={state} role={role} send={send} youId={youId} />;
+  return <TriviaQuestionView state={state} role={role} send={send} youId={youId} />;
+}
+
+function TriviaWagerView({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
+  const mg = state.minigame as TriviaState;
+  const me = state.players.find((p) => p.id === youId);
+  const myWager = me ? mg.wagers[me.id] : undefined;
+  const other = state.players.find((p) => p.id !== youId);
+  const otherSet = other ? mg.wagers[other.id] !== undefined : true;
+  const myMax = me ? Math.max(1, me.score) : 1;
+  const allSet = state.players.every((p) => mg.wagers[p.id] !== undefined);
+
+  if (role === "player" && me) {
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center gap-5 p-4 text-center">
+        <div className="text-xs uppercase tracking-widest text-[color:var(--accent-3)]">Wager</div>
+        <h2 className="text-2xl font-bold">How many points will you risk?</h2>
+        <div className="text-sm text-[color:var(--muted)]">You have {me.score} · risk 0–{myMax}</div>
+        <div className="grid grid-cols-4 gap-2 w-full max-w-md">
+          {[0, 1, 2, 3, 5, 8, 10, myMax].map((v) => (
+            <button
+              key={v}
+              onClick={() => send({ type: "minigame-input", payload: { kind: "trivia-wager", amount: v } })}
+              className={`py-4 rounded-2xl text-xl font-black ${myWager === v ? "bg-gradient-to-br from-[color:var(--accent)] to-[color:var(--accent-2)] glow-pink" : "glass"}`}
+            >
+              {v === myMax ? "ALL" : v}
+            </button>
+          ))}
+        </div>
+        <div className="text-[color:var(--muted)] text-sm">{otherSet ? "Both locked in…" : `Waiting for ${other?.name ?? "opponent"}…`}</div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center gap-6 text-center p-4">
+      <div className="text-xs uppercase tracking-widest text-[color:var(--accent-3)]">Trivia · Wagers</div>
+      <h2 className="text-3xl sm:text-5xl font-black">Place your wagers…</h2>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-xl">
+        {state.players.map((p) => (
+          <div key={p.id} className="glass rounded-2xl p-5 flex items-center justify-between">
+            <div>
+              <div className="font-bold text-lg">{p.name}</div>
+              <div className="text-xs text-[color:var(--muted)]">Score {p.score}</div>
+            </div>
+            <div className="text-3xl font-black tabular-nums">
+              {mg.wagers[p.id] === undefined ? "…" : mg.wagers[p.id]}
+            </div>
+          </div>
+        ))}
+      </div>
+      {role === "host" && allSet && (
+        <button
+          onClick={() => send({ type: "next-question" })}
+          className="px-6 py-4 rounded-2xl bg-white/10 hover:bg-white/20 font-bold"
+        >
+          Reveal question →
+        </button>
+      )}
+    </div>
+  );
+}
+
+function TriviaQuestionView({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
+  const mg = state.minigame as TriviaState;
   const now = useNow(100);
-  const q = state.questions[state.currentQuestion];
-  const buzz = state.buzz!;
+  const q = mg.questions[mg.questionIndex];
+  const buzz = mg.buzz!;
   const remaining = Math.max(0, Math.ceil((buzz.timerEndsAt - now) / 1000));
   const youBuzzed = buzz.buzzedBy === youId;
   const youLocked = role === "player" && buzz.buzzedBy && buzz.buzzedBy !== youId;
@@ -232,11 +402,13 @@ function QuestionView({ state, role, send, youId }: { state: GameState; role: "h
     if (youBuzzed) sounds.buzz();
   }, [youBuzzed]);
 
+  if (!q) return null;
+
   if (role === "player") {
     if (canBuzz) {
       return (
         <div className="flex-1 flex flex-col items-center justify-center gap-6 p-4">
-          <div className="text-xs uppercase tracking-widest text-[color:var(--muted)]">Q{state.currentQuestion + 1}</div>
+          <div className="text-xs uppercase tracking-widest text-[color:var(--muted)]">Q{mg.questionIndex + 1}</div>
           <h2 className="text-2xl font-bold text-center max-w-md leading-snug">{q.prompt}</h2>
           <div className="text-7xl font-black tabular-nums">{remaining}</div>
           <button
@@ -259,7 +431,7 @@ function QuestionView({ state, role, send, youId }: { state: GameState; role: "h
             {q.options.map((opt, i) => (
               <button
                 key={i}
-                onClick={() => send({ type: "answer", correct: i === q.correctIndex })}
+                onClick={() => send({ type: "minigame-input", payload: { kind: "trivia-answer", correct: i === q.correctIndex } })}
                 className="px-4 py-4 rounded-2xl glass text-left font-semibold text-lg hover:bg-white/10 active:scale-[0.98] transition"
               >
                 <span className="text-[color:var(--muted)] mr-2">{String.fromCharCode(65 + i)}.</span>
@@ -279,7 +451,6 @@ function QuestionView({ state, role, send, youId }: { state: GameState; role: "h
         </div>
       );
     }
-    // buzzing but haven't buzzed, or in answer mode
     return (
       <div className="flex-1 flex flex-col items-center justify-center gap-4 p-4 text-center">
         <div className="text-7xl font-black tabular-nums">{remaining}</div>
@@ -298,7 +469,7 @@ function QuestionView({ state, role, send, youId }: { state: GameState; role: "h
     return (
       <div className="flex-1 flex flex-col gap-6">
         <div className="flex items-center justify-between text-sm">
-          <div className="text-[color:var(--muted)]">Q{state.currentQuestion + 1} · {q.category}</div>
+          <div className="text-[color:var(--muted)]">Q{mg.questionIndex + 1} · {q.category}</div>
           <div className={`text-3xl font-black tabular-nums ${remaining <= 5 ? "text-[color:var(--accent)] animate-pulse" : ""}`}>{remaining}s</div>
         </div>
         <h2 className="text-3xl sm:text-5xl font-black leading-tight">{q.prompt}</h2>
@@ -319,7 +490,7 @@ function QuestionView({ state, role, send, youId }: { state: GameState; role: "h
     return (
       <div className="flex-1 flex flex-col gap-6">
         <div className="flex items-center justify-between text-sm">
-          <div className="text-[color:var(--muted)]">Q{state.currentQuestion + 1} · {q.category}</div>
+          <div className="text-[color:var(--muted)]">Q{mg.questionIndex + 1} · {q.category}</div>
           <div className={`text-3xl font-black tabular-nums ${remaining <= 5 ? "text-[color:var(--accent)] animate-pulse" : ""}`}>{remaining}s</div>
         </div>
         <h2 className="text-3xl sm:text-5xl font-black leading-tight">{q.prompt}</h2>
@@ -328,7 +499,7 @@ function QuestionView({ state, role, send, youId }: { state: GameState; role: "h
           {q.options.map((opt, i) => (
             <button
               key={i}
-              onClick={() => send({ type: "answer", correct: i === q.correctIndex })}
+              onClick={() => send({ type: "minigame-input", payload: { kind: "trivia-answer", correct: i === q.correctIndex } })}
               className="px-5 py-5 rounded-2xl glass text-lg font-semibold text-left hover:bg-white/10 active:scale-[0.98] transition"
             >
               <span className="text-[color:var(--muted)] mr-3 text-xl">{String.fromCharCode(65 + i)}</span>
@@ -344,7 +515,7 @@ function QuestionView({ state, role, send, youId }: { state: GameState; role: "h
     return (
       <div className="flex-1 flex flex-col gap-6">
         <div className="flex items-center justify-between text-sm">
-          <div className="text-[color:var(--muted)]">Q{state.currentQuestion + 1} · {q.category}</div>
+          <div className="text-[color:var(--muted)]">Q{mg.questionIndex + 1} · {q.category}</div>
           <div className="text-3xl font-black tabular-nums">{remaining}s</div>
         </div>
         <h2 className="text-3xl sm:text-5xl font-black leading-tight">{q.prompt}</h2>
@@ -356,10 +527,51 @@ function QuestionView({ state, role, send, youId }: { state: GameState; role: "h
     );
   }
 
+  // reveal phase on host
+  if (buzz.status === "reveal") {
+    const correct = buzz.answerCorrect;
+    return (
+      <div className="flex-1 flex flex-col gap-6">
+        <div className="text-sm text-[color:var(--muted)]">Q{mg.questionIndex + 1} · {q.category}</div>
+        <h2 className="text-3xl sm:text-5xl font-black leading-tight">{q.prompt}</h2>
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+          {q.options.map((opt, i) => (
+            <div
+              key={i}
+              className={`px-5 py-5 rounded-2xl glass text-lg font-semibold flex items-center gap-3 ${i === q.correctIndex ? "!border-[color:var(--good)] !bg-[color:var(--good)]/10" : ""}`}
+            >
+              <span className="text-[color:var(--muted)] text-xl">{String.fromCharCode(65 + i)}</span>
+              <span className="flex-1">{opt}</span>
+              {i === q.correctIndex && <span className="text-[color:var(--good)] font-black">✓</span>}
+            </div>
+          ))}
+        </div>
+        <div className="mt-auto flex items-center justify-between">
+          <div className="text-lg">
+            {correct ? (
+              <span className="text-[color:var(--good)] font-bold">+{mg.lastEvent?.delta ?? 1} {nameOf(state, buzz.buzzedBy)}</span>
+            ) : buzz.buzzedBy ? (
+              <span className="text-[color:var(--bad)] font-bold">{nameOf(state, buzz.buzzedBy)} wrong</span>
+            ) : (
+              <span className="text-[color:var(--muted)]">No one buzzed</span>
+            )}
+          </div>
+          <button
+            onClick={() => send({ type: "next-question" })}
+            className="px-5 py-3 rounded-2xl bg-white/10 hover:bg-white/20 font-semibold"
+          >
+            Next →
+          </button>
+        </div>
+      </div>
+    );
+  }
+
+  // Host viewing the buzzing phase
   return (
     <div className="flex-1 flex flex-col gap-6">
       <div className="flex items-center justify-between text-sm">
-        <div className="text-[color:var(--muted)]">Q{state.currentQuestion + 1} · {q.category}</div>
+        <div className="text-[color:var(--muted)]">Q{mg.questionIndex + 1} · {q.category}</div>
         <div className={`text-3xl font-black tabular-nums ${remaining <= 5 ? "text-[color:var(--accent)] animate-pulse" : ""}`}>{remaining}s</div>
       </div>
       <h2 className="text-3xl sm:text-5xl font-black leading-tight">{q.prompt}</h2>
@@ -377,168 +589,27 @@ function QuestionView({ state, role, send, youId }: { state: GameState; role: "h
       <div className="mt-auto text-center text-[color:var(--muted)]">
         {buzz.status === "buzzing" && (buzz.buzzedBy ? `${nameOf(state, buzz.buzzedBy)} buzzed…` : "Waiting for a buzz…")}
         {buzz.status === "answering" && `${nameOf(state, buzz.buzzedBy)} is picking an answer`}
-        {buzz.status === "reveal" && (buzz.answerCorrect ? "✅ Correct!" : "❌ Wrong")}
       </div>
     </div>
   );
 }
 
-function RevealView({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
-  const q = state.questions[state.currentQuestion];
-  const buzz = state.buzz!;
-  const correct = buzz.answerCorrect;
-  const youAnswered = buzz.buzzedBy === youId;
-
-  useEffect(() => {
-    if (role === "host" || youAnswered) {
-      if (correct) sounds.correct();
-      else if (buzz.buzzedBy) sounds.wrong();
-      else sounds.reveal();
-    }
-  }, [correct, buzz.buzzedBy, role, youAnswered]);
-
-  if (role === "player") {
-    return (
-      <div className="flex-1 flex flex-col items-center justify-center gap-6 p-4 text-center">
-        <div className={`text-7xl ${correct ? "" : "opacity-70"}`}>{correct ? "✅" : "❌"}</div>
-        <div className="text-3xl font-black">{correct ? "Correct!" : buzz.buzzedBy ? "Wrong" : "Time's up"}</div>
-        <div className="glass rounded-2xl px-5 py-4 max-w-md">
-          <div className="text-sm text-[color:var(--muted)]">Answer</div>
-          <div className="text-xl font-bold">{q.options[q.correctIndex]}</div>
-        </div>
-        {state.lastEvent && state.lastEvent.delta !== 0 && (
-          <div className="text-[color:var(--accent-3)] text-2xl font-black">
-            {state.lastEvent.delta > 0 ? `+${state.lastEvent.delta}` : state.lastEvent.delta}
-          </div>
-        )}
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex-1 flex flex-col gap-6">
-      <div className="text-sm text-[color:var(--muted)]">Q{state.currentQuestion + 1} · {q.category}</div>
-      <h2 className="text-3xl sm:text-5xl font-black leading-tight">{q.prompt}</h2>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-        {q.options.map((opt, i) => (
-          <div
-            key={i}
-            className={`px-5 py-5 rounded-2xl glass text-lg font-semibold flex items-center gap-3 ${i === q.correctIndex ? "!border-[color:var(--good)] !bg-[color:var(--good)]/10" : ""}`}
-          >
-            <span className="text-[color:var(--muted)] text-xl">{String.fromCharCode(65 + i)}</span>
-            <span className="flex-1">{opt}</span>
-            {i === q.correctIndex && <span className="text-[color:var(--good)] font-black">✓</span>}
-          </div>
-        ))}
-      </div>
-      <div className="mt-auto flex items-center justify-between">
-        <div className="text-lg">
-          {correct ? <span className="text-[color:var(--good)] font-bold">+{state.lastEvent?.delta ?? 1} {nameOf(state, buzz.buzzedBy)}</span>
-            : buzz.buzzedBy ? <span className="text-[color:var(--bad)] font-bold">{nameOf(state, buzz.buzzedBy)} wrong</span>
-            : <span className="text-[color:var(--muted)]">No one buzzed</span>}
-        </div>
-        <button
-          onClick={() => send({ type: "next-question" })}
-          className="px-5 py-3 rounded-2xl bg-white/10 hover:bg-white/20 font-semibold"
-        >
-          Next →
-        </button>
-      </div>
-    </div>
-  );
+function MemoryLaneActive({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
+  const mg = state.minigame as MemoryLaneState;
+  if (mg.phase === "answering") return <MemoryLaneAnswerView state={state} role={role} send={send} youId={youId} />;
+  return <MemoryLaneRevealView state={state} role={role} send={send} youId={youId} />;
 }
 
-function WagerView({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
-  const q = state.questions[state.currentQuestion];
-  const me = state.players.find((p) => p.id === youId);
-  const myWager = me ? state.wagers[me.id] : undefined;
-  const other = state.players.find((p) => p.id !== youId);
-  const otherSet = other ? state.wagers[other.id] !== undefined : true;
-  const myMax = me ? Math.max(1, me.score) : 1;
-
-  if (role === "player" && me) {
-    return (
-      <div className="flex-1 flex flex-col items-center justify-center gap-5 p-4 text-center">
-        <div className="text-xs uppercase tracking-widest text-[color:var(--accent-3)]">Round 2 · Wager</div>
-        <h2 className="text-2xl font-bold">How many points will you risk?</h2>
-        <div className="text-sm text-[color:var(--muted)]">You have {me.score} · risk 0–{myMax}</div>
-        <div className="grid grid-cols-4 gap-2 w-full max-w-md">
-          {[0, 1, 2, 3, 5, 8, 10, myMax].map((v) => (
-            <button
-              key={v}
-              onClick={() => send({ type: "set-wager", amount: v })}
-              className={`py-4 rounded-2xl text-xl font-black ${myWager === v ? "bg-gradient-to-br from-[color:var(--accent)] to-[color:var(--accent-2)] glow-pink" : "glass"}`}
-            >
-              {v === myMax ? "ALL" : v}
-            </button>
-          ))}
-        </div>
-        <div className="text-[color:var(--muted)] text-sm">{otherSet ? "Both locked in…" : `Waiting for ${other?.name ?? "opponent"}…`}</div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="flex-1 flex flex-col items-center justify-center gap-6 text-center p-4">
-      <div className="text-xs uppercase tracking-widest text-[color:var(--accent-3)]">Round 2 · Wagers</div>
-      <h2 className="text-3xl sm:text-5xl font-black">Place your wagers…</h2>
-      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-xl">
-        {state.players.map((p) => (
-          <div key={p.id} className="glass rounded-2xl p-5 flex items-center justify-between">
-            <div>
-              <div className="font-bold text-lg">{p.name}</div>
-              <div className="text-xs text-[color:var(--muted)]">Score {p.score}</div>
-            </div>
-            <div className="text-3xl font-black tabular-nums">
-              {state.wagers[p.id] === undefined ? "…" : state.wagers[p.id]}
-            </div>
-          </div>
-        ))}
-      </div>
-      {role === "host" && state.players.every((p) => state.wagers[p.id] !== undefined) && (
-        <button
-          onClick={() => send({ type: "next-question" })}
-          className="px-6 py-4 rounded-2xl bg-white/10 hover:bg-white/20 font-bold"
-        >
-          Reveal question →
-        </button>
-      )}
-      {q && role === "host" && false /* hide question during wager */ && null}
-    </div>
-  );
-}
-
-function Round3Intro({ state, isHost, send }: { state: GameState; isHost: boolean; send: Props["send"] }) {
-  return (
-    <div className="flex-1 flex flex-col items-center justify-center gap-6 text-center p-4">
-      <div className="text-xs uppercase tracking-widest text-[color:var(--accent-3)]">Round 3</div>
-      <h2 className="text-4xl sm:text-6xl font-black">Memory Lane</h2>
-      <p className="text-[color:var(--muted)] max-w-md">
-        {state.photos.length} photo{state.photos.length === 1 ? "" : "s"}. Both of you will see each photo
-        and type where and when. Then you&apos;ll see the truth and self-score.
-      </p>
-      {isHost ? (
-        <button
-          onClick={() => send({ type: "next-question" })}
-          className="px-8 py-5 rounded-2xl bg-gradient-to-br from-[color:var(--accent)] to-[color:var(--accent-2)] font-black text-2xl glow-pink"
-        >
-          Begin →
-        </button>
-      ) : (
-        <div className="text-[color:var(--muted)]">Waiting for the host to start…</div>
-      )}
-    </div>
-  );
-}
-
-function Round3Photo({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
-  const r3 = state.round3!;
-  const photo = state.photos[r3.currentPhotoIndex];
+function MemoryLaneAnswerView({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
+  const mg = state.minigame as MemoryLaneState;
+  const photo = mg.photos[mg.photoIndex];
   const now = useNow(200);
-  const remaining = Math.max(0, Math.ceil(((r3.timerEndsAt ?? now) - now) / 1000));
+  const remaining = Math.max(0, Math.ceil(((mg.timerEndsAt ?? now) - now) / 1000));
   const me = state.players.find((p) => p.id === youId);
-  const myGuess = me ? r3.guesses[me.id] : undefined;
-  const allGuessed = state.players.filter((p) => p.connected).every((p) => r3.guesses[p.id]);
+  const myGuess = me ? mg.guesses[me.id] : undefined;
+  const allGuessed = state.players.filter((p) => p.connected).every((p) => mg.guesses[p.id]);
+
+  if (!photo) return null;
 
   if (role === "player") {
     if (!me) return null;
@@ -546,21 +617,31 @@ function Round3Photo({ state, role, send, youId }: { state: GameState; role: "ho
       <div className="flex-1 flex flex-col gap-3 p-4 overflow-y-auto">
         <div className="text-center text-3xl font-black tabular-nums">{remaining}s</div>
         <div className="text-center text-xs uppercase tracking-widest text-[color:var(--muted)]">
-          Memory Lane · {r3.currentPhotoIndex + 1}/{state.photos.length}
+          Memory Lane · {mg.photoIndex + 1}/{mg.photos.length}
         </div>
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src={photo.dataUrl} alt="Memory" className="w-full max-h-[40vh] object-contain rounded-2xl glass" />
         <div className="space-y-2">
           <input
             value={myGuess?.where ?? ""}
-            onChange={(e) => send({ type: "round3-guess", where: e.target.value, when: myGuess?.when ?? "" })}
+            onChange={(e) =>
+              send({
+                type: "minigame-input",
+                payload: { kind: "memory-lane-guess", where: e.target.value, when: myGuess?.when ?? "" },
+              })
+            }
             placeholder="Where was this?"
             maxLength={80}
             className="w-full px-3 py-3 rounded-2xl bg-black/30 border border-white/10 outline-none focus:border-[color:var(--accent)] text-base"
           />
           <input
             value={myGuess?.when ?? ""}
-            onChange={(e) => send({ type: "round3-guess", where: myGuess?.where ?? "", when: e.target.value })}
+            onChange={(e) =>
+              send({
+                type: "minigame-input",
+                payload: { kind: "memory-lane-guess", where: myGuess?.where ?? "", when: e.target.value },
+              })
+            }
             placeholder="When? (e.g. 'summer 2023')"
             maxLength={80}
             className="w-full px-3 py-3 rounded-2xl bg-black/30 border border-white/10 outline-none focus:border-[color:var(--accent)] text-base"
@@ -575,18 +656,17 @@ function Round3Photo({ state, role, send, youId }: { state: GameState; role: "ho
     );
   }
 
-  // Host
   return (
     <div className="flex-1 flex flex-col gap-4 p-4">
       <div className="flex items-center justify-between text-sm">
-        <div className="text-[color:var(--muted)]">Memory Lane · {r3.currentPhotoIndex + 1}/{state.photos.length}</div>
+        <div className="text-[color:var(--muted)]">Memory Lane · {mg.photoIndex + 1}/{mg.photos.length}</div>
         <div className="text-3xl font-black tabular-nums">{remaining}s</div>
       </div>
       {/* eslint-disable-next-line @next/next/no-img-element */}
       <img src={photo.dataUrl} alt="Memory" className="w-full max-h-[50vh] object-contain rounded-2xl glass" />
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         {state.players.map((p) => {
-          const g = r3.guesses[p.id];
+          const g = mg.guesses[p.id];
           return (
             <div key={p.id} className="glass rounded-2xl p-4">
               <div className="text-sm text-[color:var(--muted)] flex items-center justify-between">
@@ -608,18 +688,20 @@ function Round3Photo({ state, role, send, youId }: { state: GameState; role: "ho
   );
 }
 
-function Round3Reveal({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
-  const r3 = state.round3!;
-  const photo = state.photos[r3.currentPhotoIndex];
+function MemoryLaneRevealView({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
+  const mg = state.minigame as MemoryLaneState;
+  const photo = mg.photos[mg.photoIndex];
   const now = useNow(200);
-  const remaining = Math.max(0, Math.ceil(((r3.timerEndsAt ?? now) - now) / 1000));
+  const remaining = Math.max(0, Math.ceil(((mg.timerEndsAt ?? now) - now) / 1000));
   const me = state.players.find((p) => p.id === youId);
-  const myScore = me ? r3.selfScored[me.id] : undefined;
-  const allScored = state.players.filter((p) => p.connected).every((p) => r3.selfScored[p.id]);
+  const myScore = me ? mg.selfScored[me.id] : undefined;
+  const allScored = state.players.filter((p) => p.connected).every((p) => mg.selfScored[p.id]);
+
+  if (!photo) return null;
 
   if (role === "player") {
     if (!me) return null;
-    const myGuess = r3.guesses[me.id];
+    const myGuess = mg.guesses[me.id];
     return (
       <div className="flex-1 flex flex-col gap-3 p-4 overflow-y-auto">
         <div className="text-center text-3xl font-black tabular-nums">{remaining}s</div>
@@ -643,28 +725,28 @@ function Round3Reveal({ state, role, send, youId }: { state: GameState; role: "h
         <div className="grid grid-cols-2 gap-2">
           <button
             disabled={myScore?.where === true}
-            onClick={() => send({ type: "round3-self-score", where: true, when: myScore?.when ?? false })}
+            onClick={() => send({ type: "minigame-input", payload: { kind: "memory-lane-score", where: true, when: myScore?.when ?? false } })}
             className={`py-3 rounded-2xl font-bold text-lg transition ${myScore?.where ? "bg-[color:var(--good)] text-black" : "glass hover:bg-white/10"}`}
           >
             Where ✓
           </button>
           <button
             disabled={myScore?.where === false}
-            onClick={() => send({ type: "round3-self-score", where: false, when: myScore?.when ?? false })}
+            onClick={() => send({ type: "minigame-input", payload: { kind: "memory-lane-score", where: false, when: myScore?.when ?? false } })}
             className={`py-3 rounded-2xl font-bold text-lg transition ${myScore?.where === false ? "bg-[color:var(--bad)]/40" : "glass hover:bg-white/10"}`}
           >
             Where ✗
           </button>
           <button
             disabled={myScore?.when === true}
-            onClick={() => send({ type: "round3-self-score", where: myScore?.where ?? false, when: true })}
+            onClick={() => send({ type: "minigame-input", payload: { kind: "memory-lane-score", where: myScore?.where ?? false, when: true } })}
             className={`py-3 rounded-2xl font-bold text-lg transition ${myScore?.when ? "bg-[color:var(--good)] text-black" : "glass hover:bg-white/10"}`}
           >
             When ✓
           </button>
           <button
             disabled={myScore?.when === false}
-            onClick={() => send({ type: "round3-self-score", where: myScore?.where ?? false, when: false })}
+            onClick={() => send({ type: "minigame-input", payload: { kind: "memory-lane-score", where: myScore?.where ?? false, when: false } })}
             className={`py-3 rounded-2xl font-bold text-lg transition ${myScore?.when === false ? "bg-[color:var(--bad)]/40" : "glass hover:bg-white/10"}`}
           >
             When ✗
@@ -675,11 +757,10 @@ function Round3Reveal({ state, role, send, youId }: { state: GameState; role: "h
     );
   }
 
-  // Host
   return (
     <div className="flex-1 flex flex-col gap-4 p-4">
       <div className="flex items-center justify-between text-sm">
-        <div className="text-[color:var(--muted)]">Revealing · {r3.currentPhotoIndex + 1}/{state.photos.length}</div>
+        <div className="text-[color:var(--muted)]">Revealing · {mg.photoIndex + 1}/{mg.photos.length}</div>
         <div className="text-3xl font-black tabular-nums">{remaining}s</div>
       </div>
       {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -698,8 +779,8 @@ function Round3Reveal({ state, role, send, youId }: { state: GameState; role: "h
       </div>
       <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
         {state.players.map((p) => {
-          const g = r3.guesses[p.id];
-          const s = r3.selfScored[p.id];
+          const g = mg.guesses[p.id];
+          const s = mg.selfScored[p.id];
           const whereRight = s?.where === true;
           const whenRight = s?.when === true;
           return (
@@ -716,7 +797,7 @@ function Round3Reveal({ state, role, send, youId }: { state: GameState; role: "h
           );
         })}
       </div>
-      {isHostAllScored(allScored) ? (
+      {allScored ? (
         <div className="text-center text-[color:var(--accent-3)]">Both scored! Moving on…</div>
       ) : (
         <button
@@ -730,44 +811,43 @@ function Round3Reveal({ state, role, send, youId }: { state: GameState; role: "h
   );
 }
 
-function isHostAllScored(allScored: boolean): boolean {
-  return allScored;
-}
-
-function TiebreakerIntro({ state, isHost, send }: { state: GameState; isHost: boolean; send: Props["send"] }) {
-  const mg = state.minigame;
-  const names: Record<string, string> = {
-    reflex: "Reflex Tap",
-    "speed-sort": "Speed Sort",
-    "type-race": "Type Race",
-  };
-  return (
-    <div className="flex-1 flex flex-col items-center justify-center gap-6 text-center p-4">
-      <div className="text-xs uppercase tracking-widest text-[color:var(--accent-3)]">Tiebreaker</div>
-      <h2 className="text-4xl sm:text-6xl font-black">You&apos;re tied.</h2>
-      <div className="glass rounded-2xl p-6 max-w-md">
-        <div className="text-sm text-[color:var(--muted)]">Up next</div>
-        <div className="text-3xl font-black mt-1">{mg ? names[mg.type] : ""}</div>
-        <p className="mt-3 text-sm text-[color:var(--muted)]">
-          {mg?.type === "reflex" && "When the light turns green, mash your button. Most taps in 1.5s wins."}
-          {mg?.type === "speed-sort" && "Sort 8 items into the right bins. First to clear wins."}
-          {mg?.type === "type-race" && "Type the phrase as fast as you can. First to finish wins."}
-        </p>
-      </div>
-      {isHost && (
+function ReflexActive({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
+  const mg = state.minigame as ReflexState;
+  if (role === "player") {
+    const me = state.players.find((p) => p.id === youId);
+    if (!me) return null;
+    const key = state.players[0].id === me.id ? "p1" : "p2";
+    return (
+      <div className="flex-1 flex flex-col items-center justify-center gap-4 p-4">
+        <div className="text-7xl font-black tabular-nums">{mg.lightsOn ? "GO" : "Wait…"}</div>
         <button
-          onClick={() => send({ type: "minigame-start" })}
-          className="px-8 py-5 rounded-2xl bg-gradient-to-br from-[color:var(--accent)] to-[color:var(--accent-2)] font-black text-2xl glow-pink"
+          disabled={!mg.lightsOn}
+          onClick={() => send({ type: "minigame-input", payload: { kind: "reflex-tap" } })}
+          className={`w-72 h-72 rounded-full text-4xl font-black transition-all ${mg.lightsOn ? "bg-gradient-to-br from-[color:var(--accent)] to-[color:var(--accent-2)] glow-pink active:scale-95" : "bg-white/10 opacity-50"}`}
         >
-          Start tiebreaker →
+          {mg.lightsOn ? "TAP!" : "..."}
         </button>
-      )}
+        <div className="text-[color:var(--muted)] text-sm">Taps: {mg.taps[key]}</div>
+      </div>
+    );
+  }
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center gap-6 p-4 text-center">
+      <div className="text-7xl font-black tabular-nums">{mg.status === "live" ? (mg.lightsOn ? "GO!" : "Wait for green…") : "..."}</div>
+      <div className="grid grid-cols-2 gap-3 w-full max-w-md">
+        {state.players.map((p, i) => (
+          <div key={p.id} className="glass rounded-2xl p-4">
+            <div className="text-sm text-[color:var(--muted)]">{p.name}</div>
+            <div className="text-4xl font-black tabular-nums">{mg.taps[i === 0 ? "p1" : "p2"]}</div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
 
-function TiebreakerPlay({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
-  const mg = state.minigame!;
+function SpeedSortActive({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
+  const mg = state.minigame as SpeedSortState;
   const now = useNow(100);
   const remaining = Math.max(0, Math.ceil((mg.startedAt + mg.duration - now) / 1000));
 
@@ -775,51 +855,60 @@ function TiebreakerPlay({ state, role, send, youId }: { state: GameState; role: 
     const me = state.players.find((p) => p.id === youId);
     if (!me) return null;
     const key = state.players[0].id === me.id ? "p1" : "p2";
-    if (mg.type === "reflex") {
-      return (
-        <div className="flex-1 flex flex-col items-center justify-center gap-4 p-4">
-          <div className="text-7xl font-black tabular-nums">{mg.lightsOn ? "GO" : "Wait…"}</div>
-          <button
-            disabled={!mg.lightsOn}
-            onClick={() => send({ type: "minigame-input", payload: { tap: true } })}
-            className={`w-72 h-72 rounded-full text-4xl font-black transition-all ${mg.lightsOn ? "bg-gradient-to-br from-[color:var(--accent)] to-[color:var(--accent-2)] glow-pink active:scale-95" : "bg-white/10 opacity-50"}`}
-          >
-            {mg.lightsOn ? "TAP!" : "..."}
-          </button>
-          <div className="text-[color:var(--muted)] text-sm">Taps: {mg.taps[key]}</div>
+    const myBin = key === "p1" ? "left" : "right";
+    return (
+      <div className="flex-1 flex flex-col gap-4 p-4">
+        <div className="text-center text-3xl font-black tabular-nums">{remaining}s · {mg.progress[key]}/{mg.items.length}</div>
+        <div className="grid grid-cols-2 gap-2">
+          {mg.items.map((it, i) => {
+            const isDone = i < mg.progress[key];
+            return (
+              <button
+                key={it.id}
+                disabled={isDone}
+                onClick={() => {
+                  const correct = it.bin === myBin;
+                  send({ type: "minigame-input", payload: { kind: "speed-sort-place", itemId: it.id, correct } });
+                }}
+                className={`px-3 py-4 rounded-2xl text-base font-bold ${isDone ? "opacity-30" : "glass active:scale-95"}`}
+              >
+                {it.label}
+              </button>
+            );
+          })}
         </div>
-      );
-    }
-    if (mg.type === "speed-sort") {
-      return (
-        <div className="flex-1 flex flex-col gap-4 p-4">
-          <div className="text-center text-3xl font-black tabular-nums">{remaining}s · {mg.progress[key]}/{mg.items.length}</div>
-          <div className="grid grid-cols-2 gap-2">
-            {mg.items.map((it, i) => {
-              const isDone = i < mg.progress[key];
-              return (
-                <button
-                  key={it.id}
-                  disabled={isDone}
-                  onClick={() => {
-                    const isCorrect = (key === "p1" ? it.bin === "left" : it.bin === "right");
-                    send({ type: "minigame-input", payload: { itemId: it.id, correct: isCorrect } });
-                  }}
-                  className={`px-3 py-4 rounded-2xl text-base font-bold ${isDone ? "opacity-30" : "glass active:scale-95"}`}
-                >
-                  {it.label}
-                </button>
-              );
-            })}
-          </div>
-          <div className="flex justify-around text-sm text-[color:var(--muted)]">
-            <span>← {key === "p1" ? "Fruits" : "Veggies"}</span>
-            <span>{key === "p1" ? "Veggies" : "Fruits"} →</span>
-          </div>
+        <div className="flex justify-around text-sm text-[color:var(--muted)]">
+          <span>← {myBin === "left" ? "Fruits" : "Veggies"}</span>
+          <span>{myBin === "left" ? "Veggies" : "Fruits"} →</span>
         </div>
-      );
-    }
-    // type-race
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex-1 flex flex-col items-center justify-center gap-6 p-4 text-center">
+      <div className="text-7xl font-black tabular-nums">{remaining}</div>
+      <div className="grid grid-cols-2 gap-3 w-full max-w-md">
+        {state.players.map((p, i) => (
+          <div key={p.id} className="glass rounded-2xl p-4">
+            <div className="text-sm text-[color:var(--muted)]">{p.name}</div>
+            <div className="text-4xl font-black tabular-nums">{mg.progress[i === 0 ? "p1" : "p2"]}/{mg.items.length}</div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TypeRaceActive({ state, role, send, youId }: { state: GameState; role: "host" | "player"; send: Props["send"]; youId: string }) {
+  const mg = state.minigame as TypeRaceState;
+  const now = useNow(100);
+  const remaining = Math.max(0, Math.ceil((mg.startedAt + mg.duration - now) / 1000));
+
+  if (role === "player") {
+    const me = state.players.find((p) => p.id === youId);
+    if (!me) return null;
+    const key = state.players[0].id === me.id ? "p1" : "p2";
     return (
       <div className="flex-1 flex flex-col items-center justify-center gap-4 p-4">
         <div className="text-3xl font-black tabular-nums">{remaining}s</div>
@@ -828,7 +917,7 @@ function TiebreakerPlay({ state, role, send, youId }: { state: GameState; role: 
         <input
           autoFocus
           value={mg.typed[key]}
-          onChange={(e) => send({ type: "minigame-input", payload: { typed: e.target.value } })}
+          onChange={(e) => send({ type: "minigame-input", payload: { kind: "type-race-typed", text: e.target.value } })}
           className="w-full max-w-md px-4 py-4 rounded-2xl bg-black/30 border border-white/10 outline-none focus:border-[color:var(--accent)] text-2xl font-mono"
         />
         {mg.finishedAt[key] !== null && <div className="text-[color:var(--good)] font-black text-2xl">DONE!</div>}
@@ -836,50 +925,66 @@ function TiebreakerPlay({ state, role, send, youId }: { state: GameState; role: 
     );
   }
 
-  // Host view of minigame
   return (
     <div className="flex-1 flex flex-col items-center justify-center gap-6 p-4 text-center">
       <div className="text-7xl font-black tabular-nums">{remaining}</div>
-      {mg.type === "reflex" && (
-        <div className="text-3xl font-bold">{mg.lightsOn ? "GO!" : "Wait for green…"}</div>
-      )}
-      {mg.type === "speed-sort" && (
-        <div className="grid grid-cols-2 gap-3 w-full max-w-md">
-          {state.players.map((p, i) => (
-            <div key={p.id} className="glass rounded-2xl p-4">
-              <div className="text-sm text-[color:var(--muted)]">{p.name}</div>
-              <div className="text-4xl font-black tabular-nums">{mg.progress[i === 0 ? "p1" : "p2"]}/{mg.items.length}</div>
-            </div>
-          ))}
-        </div>
-      )}
-      {mg.type === "type-race" && (
-        <div className="space-y-3 w-full max-w-md">
-          {state.players.map((p, i) => {
-            const k = i === 0 ? "p1" : "p2";
-            return (
-              <div key={p.id} className="glass rounded-2xl p-4 text-left">
-                <div className="text-sm text-[color:var(--muted)] flex justify-between">
-                  <span>{p.name}</span>
-                  <span>{mg.finishedAt[k] !== null ? "DONE" : `${mg.typed[k].length}/${mg.prompt.length}`}</span>
-                </div>
-                <div className="mt-2 text-lg font-mono">{mg.typed[k] || "…"}</div>
+      <div className="space-y-3 w-full max-w-md">
+        {state.players.map((p, i) => {
+          const k = i === 0 ? "p1" : "p2";
+          return (
+            <div key={p.id} className="glass rounded-2xl p-4 text-left">
+              <div className="text-sm text-[color:var(--muted)] flex justify-between">
+                <span>{p.name}</span>
+                <span>{mg.finishedAt[k] !== null ? "DONE" : `${mg.typed[k].length}/${mg.prompt.length}`}</span>
               </div>
-            );
-          })}
-        </div>
-      )}
+              <div className="mt-2 text-lg font-mono">{mg.typed[k] || "…"}</div>
+            </div>
+          );
+        })}
+      </div>
     </div>
   );
 }
 
-function TiebreakerResult({ state }: { state: GameState }) {
-  const mg = state.minigame!;
-  const winner = state.players.find((p) => p.id === mg.winnerId);
+function MinigameEnd({ state, isHost, send }: { state: GameState; isHost: boolean; send: Props["send"] }) {
+  const result = state.minigameResult!;
+  const meta = MINIGAME_META.find((m) => m.id === result.id);
+  const winner = result.winnerId ? state.players.find((p) => p.id === result.winnerId) : null;
+  const total = state.playedCount;
+  const totalRounds = state.settings.matchLength;
   return (
-    <div className="flex-1 flex flex-col items-center justify-center text-center gap-4 p-4">
-      <div className="text-7xl">🏆</div>
-      <div className="text-3xl font-black">{winner ? `${winner.name} wins!` : "Draw!"}</div>
+    <div className="flex-1 flex flex-col items-center justify-center text-center gap-5 p-4">
+      <div className="text-xs uppercase tracking-widest text-[color:var(--muted)]">
+        Round {total} of {totalRounds} · {meta?.label ?? "Done"}
+      </div>
+      <div className="text-7xl">{winner ? "🏆" : "🤝"}</div>
+      <div className="text-3xl font-black">
+        {winner ? `${winner.name} wins this round` : "Draw"}
+      </div>
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 w-full max-w-md">
+        {state.players.map((p) => {
+          const delta = result.scoreDeltas[p.id] ?? 0;
+          return (
+            <div key={p.id} className="glass rounded-2xl p-4 flex items-center justify-between">
+              <div>
+                <div className="font-bold">{p.name}</div>
+                <div className="text-xs text-[color:var(--muted)]">Score {p.score}</div>
+              </div>
+              <div className={`text-2xl font-black tabular-nums ${delta > 0 ? "text-[color:var(--good)]" : ""}`}>
+                {delta > 0 ? `+${delta}` : delta}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {isHost && (
+        <button
+          onClick={() => send({ type: "next-question" })}
+          className="mt-2 px-6 py-4 rounded-2xl bg-white/10 hover:bg-white/20 font-bold"
+        >
+          {total < totalRounds ? "Next minigame →" : "See final →"}
+        </button>
+      )}
     </div>
   );
 }
@@ -914,6 +1019,32 @@ function FinalView({ state, isHost, send }: { state: GameState; isHost: boolean;
         </button>
       )}
     </div>
+  );
+}
+
+function getRoomFromUrl(): string {
+  if (typeof window === "undefined") return "";
+  const m = window.location.pathname.match(/\/(host|play)\/([A-Z]{4})/);
+  return m?.[2] ?? "";
+}
+
+function CopyButton({ value }: { value: string }) {
+  const [copied, setCopied] = useState(false);
+  async function copy() {
+    try {
+      await navigator.clipboard.writeText(value);
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1200);
+    } catch {}
+  }
+  return (
+    <button
+      onClick={copy}
+      className="shrink-0 px-2.5 py-1 rounded-full glass text-xs font-semibold hover:bg-white/10"
+      aria-label="Copy room URL"
+    >
+      {copied ? "Copied ✓" : "Copy"}
+    </button>
   );
 }
 

@@ -6,8 +6,8 @@ const geistSans = Geist({ variable: "--font-geist-sans", subsets: ["latin"] });
 const geistMono = Geist_Mono({ variable: "--font-geist-mono", subsets: ["latin"] });
 
 export const metadata: Metadata = {
-  title: "Buzzer Battle — a game for two",
-  description: "Trivia and minigames, played on the couch with phones as buzzers.",
+  title: "magame — a game for two",
+  description: "A couch game for two. Trivia and quick minigames, played on the big screen with two phones.",
 };
 
 export const viewport: Viewport = {

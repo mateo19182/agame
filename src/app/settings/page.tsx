@@ -1,41 +1,67 @@
 "use client";
 
-import { useState, useRef } from "react";
+import { useRef, useState } from "react";
 import Link from "next/link";
-import type { GameSettings, PhotoEntry } from "@/lib/game";
-import { fileToPhoto, loadPhotos, savePhotos } from "@/lib/photos";
+import type { GameSettings, MinigameConfigMap, MinigameId, PhotoEntry } from "@/lib/game";
+import { MINIGAME_META, defaultSettings } from "@/lib/game";
+import { fileToPhoto } from "@/lib/photos";
 import { LogoutButton } from "@/components/LogoutButton";
 
-const KEY = "agame:settings";
-
-const DEFAULTS: GameSettings = {
-  pack: "general",
-  difficulty: "medium",
-  round1Questions: 8,
-  round2Questions: 3,
-  playTiebreaker: true,
-  photos: [],
-};
+const KEY = "agame:v2:settings";
 
 function loadInitial(): GameSettings {
-  if (typeof window === "undefined") return DEFAULTS;
+  if (typeof window === "undefined") return defaultSettings();
   try {
     const raw = localStorage.getItem(KEY);
     if (raw) {
-      const parsed = JSON.parse(raw);
-      return { ...DEFAULTS, ...parsed, photos: loadPhotos() };
+      const parsed = JSON.parse(raw) as Partial<GameSettings>;
+      return mergeSettings(parsed);
     }
   } catch {}
-  return { ...DEFAULTS, photos: loadPhotos() };
+  return defaultSettings();
+}
+
+function mergeSettings(partial: Partial<GameSettings> | undefined): GameSettings {
+  const base = defaultSettings();
+  if (!partial) return base;
+  const cfg: MinigameConfigMap = {
+    ...base.minigames,
+    ...(partial.minigames ?? {}),
+  } as MinigameConfigMap;
+  return {
+    minigames: cfg,
+    matchLength:
+      typeof partial.matchLength === "number" && partial.matchLength > 0
+        ? Math.floor(partial.matchLength)
+        : base.matchLength,
+    allowRepeats: typeof partial.allowRepeats === "boolean" ? partial.allowRepeats : base.allowRepeats,
+  };
 }
 
 export default function SettingsPage() {
   const [settings, setSettings] = useState<GameSettings>(loadInitial);
   const [saved, setSaved] = useState(false);
 
-  function update<K extends keyof GameSettings>(key: K, value: GameSettings[K]) {
+  function updateMinigame<K extends MinigameId>(id: K, patch: Partial<MinigameConfigMap[K]>) {
+    const current = settings.minigames[id];
+    const next: GameSettings = {
+      ...settings,
+      minigames: {
+        ...settings.minigames,
+        [id]: { ...current, ...patch } as MinigameConfigMap[K],
+      },
+    };
+    setSettings(next);
+    persist(next);
+  }
+
+  function updateMatch<K extends keyof GameSettings>(key: K, value: GameSettings[K]) {
     const next = { ...settings, [key]: value };
     setSettings(next);
+    persist(next);
+  }
+
+  function persist(next: GameSettings) {
     try {
       localStorage.setItem(KEY, JSON.stringify(next));
       setSaved(true);
@@ -45,79 +71,71 @@ export default function SettingsPage() {
 
   return (
     <main className="flex-1 flex flex-col items-center justify-center px-4 py-10">
-      <div className="w-full max-w-xl glass rounded-3xl p-6 sm:p-8">
+      <div className="w-full max-w-2xl glass rounded-3xl p-6 sm:p-8">
         <div className="flex items-center justify-between">
           <h1 className="text-3xl font-black">Settings</h1>
           <Link href="/" className="text-sm text-[color:var(--muted)] hover:text-white">← Back</Link>
         </div>
         <p className="mt-2 text-sm text-[color:var(--muted)]">
-          These apply to the next game you host. Players join with the room code.
+          Configure each minigame. The host picks which ones to play in the lobby.
         </p>
 
-        <Section title="Trivia pack">
-          <Radio
-            label="General (Open Trivia DB)"
-            description="Pop culture, science, geography, history…"
-            checked={settings.pack === "general"}
-            onChange={() => update("pack", "general")}
+        <div className="mt-6 space-y-6">
+          <TriviaConfigCard
+            cfg={settings.minigames.trivia}
+            onChange={(patch) => updateMinigame("trivia", patch)}
           />
-          <Radio
-            label='"Us" (personal)'
-            description="Hand-written questions about your relationship. Customize in src/lib/usQuestions.ts"
-            checked={settings.pack === "us"}
-            onChange={() => update("pack", "us")}
+          <MemoryLaneConfigCard
+            photos={settings.minigames["memory-lane"].photos}
+            onChange={(photos) => updateMinigame("memory-lane", { photos })}
           />
-          <Radio
-            label="Mixed"
-            description="Half personal, half general."
-            checked={settings.pack === "mixed"}
-            onChange={() => update("pack", "mixed")}
+          <ReflexConfigCard
+            cfg={settings.minigames.reflex}
+            onChange={(patch) => updateMinigame("reflex", patch)}
           />
-        </Section>
+          <SpeedSortConfigCard
+            cfg={settings.minigames["speed-sort"]}
+            onChange={(patch) => updateMinigame("speed-sort", patch)}
+          />
+          <TypeRaceConfigCard
+            cfg={settings.minigames["type-race"]}
+            onChange={(patch) => updateMinigame("type-race", patch)}
+          />
+        </div>
 
-        {settings.pack !== "us" && (
-          <Section title="Difficulty (general trivia only)">
-            <PillRow
-              options={["easy", "medium", "hard"] as const}
-              value={settings.difficulty}
-              onChange={(v) => update("difficulty", v)}
-            />
-          </Section>
-        )}
-
-        <Section title="Round 1 questions">
-          <PillRow
-            options={[5, 6, 8, 10, 12] as const}
-            value={settings.round1Questions as 5 | 6 | 8 | 10 | 12}
-            format={(v) => `${v}`}
-            onChange={(v) => update("round1Questions", v)}
-          />
-        </Section>
-
-        <Section title="Round 2 wager questions">
-          <PillRow
-            options={[1, 2, 3, 5] as const}
-            value={settings.round2Questions as 1 | 2 | 3 | 5}
-            onChange={(v) => update("round2Questions", v)}
-          />
-        </Section>
-
-        <Section title="Tiebreaker">
-          <Toggle
-            label="Play a minigame if you're tied at the end"
-            checked={settings.playTiebreaker}
-            onChange={(v) => update("playTiebreaker", v)}
-          />
-        </Section>
-
-        <Section title="Memory Lane · Round 3">
-          <MemoryLane
-            photos={settings.photos}
-            onChange={(photos) => {
-              savePhotos(photos);
-              update("photos", photos);
-            }}
-          />
+        <Section title="Match defaults">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+            <div>
+              <div className="text-xs uppercase tracking-widest text-[color:var(--muted)] mb-1">Rounds per match</div>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={() => updateMatch("matchLength", Math.max(1, settings.matchLength - 1))}
+                  className="w-9 h-9 rounded-full glass font-black"
+                >
+                  −
+                </button>
+                <div className="flex-1 text-center text-2xl font-black tabular-nums">{settings.matchLength}</div>
+                <button
+                  onClick={() => updateMatch("matchLength", Math.min(20, settings.matchLength + 1))}
+                  className="w-9 h-9 rounded-full glass font-black"
+                >
+                  +
+                </button>
+              </div>
+            </div>
+            <div>
+              <div className="text-xs uppercase tracking-widest text-[color:var(--muted)] mb-1">Allow repeats</div>
+              <button
+                onClick={() => updateMatch("allowRepeats", !settings.allowRepeats)}
+                className="w-full flex items-center justify-between px-4 py-3 rounded-2xl border border-white/10"
+              >
+                <span className="font-semibold">Pick a minigame twice</span>
+                <span className={`w-12 h-7 rounded-full p-1 transition ${settings.allowRepeats ? "bg-[color:var(--accent)]" : "bg-white/10"}`}>
+                  <span className={`block w-5 h-5 rounded-full bg-white transition ${settings.allowRepeats ? "translate-x-5" : ""}`} />
+                </span>
+              </button>
+            </div>
+          </div>
         </Section>
 
         <div className="mt-6 flex items-center justify-between">
@@ -137,7 +155,7 @@ export default function SettingsPage() {
 
 function Section({ title, children }: { title: string; children: React.ReactNode }) {
   return (
-    <div className="mt-6">
+    <div>
       <div className="text-xs uppercase tracking-widest text-[color:var(--muted)] mb-2">{title}</div>
       <div className="space-y-2">{children}</div>
     </div>
@@ -152,17 +170,6 @@ function Radio({ label, description, checked, onChange }: { label: string; descr
     >
       <div className="font-semibold">{label}</div>
       {description && <div className="text-xs text-[color:var(--muted)] mt-0.5">{description}</div>}
-    </button>
-  );
-}
-
-function Toggle({ label, checked, onChange }: { label: string; checked: boolean; onChange: (v: boolean) => void }) {
-  return (
-    <button onClick={() => onChange(!checked)} className="w-full flex items-center justify-between px-4 py-3 rounded-2xl border border-white/10">
-      <span className="font-semibold">{label}</span>
-      <span className={`w-12 h-7 rounded-full p-1 transition ${checked ? "bg-[color:var(--accent)]" : "bg-white/10"}`}>
-        <span className={`block w-5 h-5 rounded-full bg-white transition ${checked ? "translate-x-5" : ""}`} />
-      </span>
     </button>
   );
 }
@@ -183,7 +190,89 @@ function PillRow<T extends string | number>({ options, value, onChange, format }
   );
 }
 
-function MemoryLane({ photos, onChange }: { photos: PhotoEntry[]; onChange: (p: PhotoEntry[]) => void }) {
+function Card({ id, title, description, children }: { id: MinigameId; title: string; description: string; children: React.ReactNode }) {
+  const meta = MINIGAME_META.find((m) => m.id === id)!;
+  return (
+    <div className="glass rounded-3xl p-5">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-lg font-black">{title}</div>
+          <div className="text-xs text-[color:var(--muted)] mt-0.5">{description}</div>
+        </div>
+        <div className="text-2xl">{meta.id === "trivia" ? "🧠" : meta.id === "memory-lane" ? "📸" : meta.id === "reflex" ? "⚡" : meta.id === "speed-sort" ? "🍎" : "⌨️"}</div>
+      </div>
+      <div className="mt-4 space-y-3">{children}</div>
+    </div>
+  );
+}
+
+function TriviaConfigCard({ cfg, onChange }: { cfg: MinigameConfigMap["trivia"]; onChange: (patch: Partial<MinigameConfigMap["trivia"]>) => void }) {
+  return (
+    <Card id="trivia" title="Trivia" description="Buzz in and answer. Optionally wagers for high-stakes questions.">
+      <Section title="Pack">
+        <Radio
+          label="General (Open Trivia DB)"
+          description="Pop culture, science, geography, history…"
+          checked={cfg.pack === "general"}
+          onChange={() => onChange({ pack: "general" })}
+        />
+        <Radio
+          label='"Us" (personal)'
+          description="Hand-written questions about your relationship. Customize in src/lib/usQuestions.ts"
+          checked={cfg.pack === "us"}
+          onChange={() => onChange({ pack: "us" })}
+        />
+        <Radio
+          label="Mixed"
+          description="Half personal, half general."
+          checked={cfg.pack === "mixed"}
+          onChange={() => onChange({ pack: "mixed" })}
+        />
+      </Section>
+
+      {cfg.pack !== "us" && (
+        <Section title="Difficulty (general trivia only)">
+          <PillRow
+            options={["easy", "medium", "hard"] as const}
+            value={cfg.difficulty}
+            onChange={(v) => onChange({ difficulty: v })}
+          />
+        </Section>
+      )}
+
+      <Section title="Question count">
+        <PillRow
+          options={[5, 6, 8, 10, 12] as const}
+          value={cfg.questionCount as 5 | 6 | 8 | 10 | 12}
+          format={(v) => `${v}`}
+          onChange={(v) => onChange({ questionCount: v })}
+        />
+      </Section>
+
+      <Section title="Mode">
+        <button
+          onClick={() => onChange({ useWagers: !cfg.useWagers })}
+          className="w-full flex items-center justify-between px-4 py-3 rounded-2xl border border-white/10"
+        >
+          <span className="font-semibold">Use wagers (each player risks points)</span>
+          <span className={`w-12 h-7 rounded-full p-1 transition ${cfg.useWagers ? "bg-[color:var(--accent)]" : "bg-white/10"}`}>
+            <span className={`block w-5 h-5 rounded-full bg-white transition ${cfg.useWagers ? "translate-x-5" : ""}`} />
+          </span>
+        </button>
+      </Section>
+    </Card>
+  );
+}
+
+function MemoryLaneConfigCard({ photos, onChange }: { photos: PhotoEntry[]; onChange: (photos: PhotoEntry[]) => void }) {
+  return (
+    <Card id="memory-lane" title="Memory Lane" description="Your own photos: guess where & when.">
+      <MemoryLaneUploader photos={photos} onChange={onChange} />
+    </Card>
+  );
+}
+
+function MemoryLaneUploader({ photos, onChange }: { photos: PhotoEntry[]; onChange: (p: PhotoEntry[]) => void }) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -224,7 +313,7 @@ function MemoryLane({ photos, onChange }: { photos: PhotoEntry[]; onChange: (p: 
         <div className="mt-2 font-semibold">{busy ? "Processing…" : "Drop photos or tap to upload"}</div>
         <div className="text-xs text-[color:var(--muted)] mt-1">
           {photos.length === 0
-            ? "No photos yet. Add at least one to enable Round 3."
+            ? "No photos yet. Add at least one to enable this minigame."
             : `${photos.length} photo${photos.length === 1 ? "" : "s"} ready`}
         </div>
         <input
@@ -281,5 +370,74 @@ function MemoryLane({ photos, onChange }: { photos: PhotoEntry[]; onChange: (p: 
         </div>
       )}
     </div>
+  );
+}
+
+function ReflexConfigCard({ cfg, onChange }: { cfg: MinigameConfigMap["reflex"]; onChange: (patch: Partial<MinigameConfigMap["reflex"]>) => void }) {
+  return (
+    <Card id="reflex" title="Reflex Tap" description="Wait for green light, then mash.">
+      <Section title="Tap window after green (ms)">
+        <PillRow
+          options={[1000, 1500, 2000, 3000] as const}
+          value={cfg.durationMs as 1000 | 1500 | 2000 | 3000}
+          format={(v) => `${v / 1000}s`}
+          onChange={(v) => onChange({ durationMs: v })}
+        />
+      </Section>
+      <Section title="Light delay range">
+        <div className="grid grid-cols-2 gap-2">
+          <label className="text-xs text-[color:var(--muted)]">
+            Min (ms)
+            <input
+              type="number"
+              min={300}
+              step={100}
+              value={cfg.lightDelayMinMs}
+              onChange={(e) => onChange({ lightDelayMinMs: Math.max(0, Number(e.target.value) || 0) })}
+              className="mt-1 w-full px-3 py-2 rounded-xl bg-black/30 border border-white/10 outline-none focus:border-[color:var(--accent)]"
+            />
+          </label>
+          <label className="text-xs text-[color:var(--muted)]">
+            Max (ms)
+            <input
+              type="number"
+              min={300}
+              step={100}
+              value={cfg.lightDelayMaxMs}
+              onChange={(e) => onChange({ lightDelayMaxMs: Math.max(cfg.lightDelayMinMs, Number(e.target.value) || 0) })}
+              className="mt-1 w-full px-3 py-2 rounded-xl bg-black/30 border border-white/10 outline-none focus:border-[color:var(--accent)]"
+            />
+          </label>
+        </div>
+      </Section>
+    </Card>
+  );
+}
+
+function SpeedSortConfigCard({ cfg, onChange }: { cfg: MinigameConfigMap["speed-sort"]; onChange: (patch: Partial<MinigameConfigMap["speed-sort"]>) => void }) {
+  return (
+    <Card id="speed-sort" title="Speed Sort" description="Sort fruits and veggies into bins.">
+      <Section title="Items per round">
+        <PillRow
+          options={[2, 4, 6, 8] as const}
+          value={cfg.itemCount as 2 | 4 | 6 | 8}
+          onChange={(v) => onChange({ itemCount: v })}
+        />
+      </Section>
+    </Card>
+  );
+}
+
+function TypeRaceConfigCard({ cfg, onChange }: { cfg: MinigameConfigMap["type-race"]; onChange: (patch: Partial<MinigameConfigMap["type-race"]>) => void }) {
+  return (
+    <Card id="type-race" title="Type Race" description="Type the phrase fastest.">
+      <Section title="Prompt variety (count of prompts)">
+        <PillRow
+          options={[1, 2, 3, 4] as const}
+          value={cfg.promptCount as 1 | 2 | 3 | 4}
+          onChange={(v) => onChange({ promptCount: v })}
+        />
+      </Section>
+    </Card>
   );
 }

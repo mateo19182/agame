@@ -44,13 +44,12 @@ export default function Landing() {
           Couch edition
         </div>
         <h1 className="mt-6 text-5xl sm:text-7xl font-black tracking-tight text-shadow-lg">
-          Buzzer
           <span className="bg-gradient-to-r from-[color:var(--accent)] to-[color:var(--accent-2)] bg-clip-text text-transparent">
-            {" "}Battle
+            magame
           </span>
         </h1>
         <p className="mt-4 text-[color:var(--muted)] text-lg max-w-xl mx-auto">
-          Trivia duels and quick minigames. One screen for the board, two phones for the buzzers.
+          A couch game for two. Trivia duels and quick minigames — pick your mix, then play on the big screen with two phones.
         </p>
       </div>
 

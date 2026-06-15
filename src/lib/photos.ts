@@ -2,8 +2,6 @@
 
 import type { PhotoEntry } from "./game";
 
-const STORAGE_KEY = "agame:photos";
-
 const MAX_DIMENSION = 800;
 const JPEG_QUALITY = 0.78;
 
@@ -44,35 +42,6 @@ function resizeToDataUrl(src: string, maxDim = MAX_DIMENSION, quality = JPEG_QUA
         resolve(canvas.toDataURL("image/jpeg", quality));
       })
   );
-}
-
-export function loadPhotos(): PhotoEntry[] {
-  if (typeof window === "undefined") return [];
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    return parsed.filter(
-      (p): p is PhotoEntry =>
-        p &&
-        typeof p.id === "string" &&
-        typeof p.dataUrl === "string" &&
-        typeof p.where === "string" &&
-        typeof p.when === "string"
-    );
-  } catch {
-    return [];
-  }
-}
-
-export function savePhotos(photos: PhotoEntry[]): void {
-  if (typeof window === "undefined") return;
-  try {
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(photos));
-  } catch (err) {
-    console.warn("savePhotos failed (storage full?)", err);
-  }
 }
 
 export async function fileToPhoto(file: File): Promise<PhotoEntry> {

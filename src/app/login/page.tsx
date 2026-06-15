@@ -25,7 +25,7 @@ export default async function LoginPage({
             Private
           </div>
           <h1 className="text-4xl sm:text-5xl font-black tracking-tight text-shadow-lg">
-            Buzzer<span className="bg-gradient-to-r from-[color:var(--accent)] to-[color:var(--accent-2)] bg-clip-text text-transparent"> Battle</span>
+            <span className="bg-gradient-to-r from-[color:var(--accent)] to-[color:var(--accent-2)] bg-clip-text text-transparent">magame</span>
           </h1>
           <p className="mt-3 text-[color:var(--muted)]">Enter the password to play.</p>
         </div>

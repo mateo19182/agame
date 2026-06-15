@@ -3,26 +3,25 @@
 import { use, useEffect, useState } from "react";
 import { useRoom } from "@/lib/useRoom";
 import { GameView } from "@/components/GameView";
-import type { GameSettings, PhotoEntry } from "@/lib/game";
-import { loadPhotos } from "@/lib/photos";
+import type { GameSettings } from "@/lib/game";
+import { defaultSettings } from "@/lib/game";
 
-const SETTINGS_KEY = "agame:settings";
-const DEFAULT_SETTINGS: GameSettings = {
-  pack: "general",
-  difficulty: "medium",
-  round1Questions: 8,
-  round2Questions: 3,
-  playTiebreaker: true,
-  photos: [],
-};
+const SETTINGS_KEY = "agame:v2:settings";
 
 function loadSettings(): GameSettings {
-  if (typeof window === "undefined") return DEFAULT_SETTINGS;
+  if (typeof window === "undefined") return defaultSettings();
   try {
     const raw = localStorage.getItem(SETTINGS_KEY);
-    if (raw) return { ...DEFAULT_SETTINGS, ...JSON.parse(raw) };
+    if (raw) {
+      const parsed = JSON.parse(raw) as Partial<GameSettings>;
+      return {
+        ...defaultSettings(),
+        ...parsed,
+        minigames: { ...defaultSettings().minigames, ...(parsed.minigames ?? {}) },
+      } as GameSettings;
+    }
   } catch {}
-  return DEFAULT_SETTINGS;
+  return defaultSettings();
 }
 
 function readName(code: string): string {
@@ -71,8 +70,7 @@ export default function HostPage({ params }: { params: Promise<{ code: string }>
   const sendWithSettings: typeof room.send = (msg) => {
     if (msg.type === "start-game") {
       const settings = loadSettings();
-      const photos: PhotoEntry[] = loadPhotos();
-      room.send({ ...msg, settings, photos });
+      room.send({ ...msg, settings });
       return;
     }
     room.send(msg);
