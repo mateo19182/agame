@@ -1,48 +1,44 @@
-"use client";
-
 import { useEffect, useRef, useState, useCallback } from "react";
-import type { ClientMessage, GameState, ServerMessage } from "./game";
+import type { ClientMessage, ServerErrorCode, GameState, ServerMessage } from "@shared/game";
 
-function resolveHost(): string {
-  const envHost = process.env.NEXT_PUBLIC_REALTIME_HOST;
-  if (envHost) return envHost;
-  if (typeof window !== "undefined" && window.location.hostname === "localhost") {
-    return "localhost:1999";
-  }
-  return "agame-party.mateoamadoares.workers.dev";
-}
-
-function wsUrl(roomId: string): string {
-  const protocol = typeof window !== "undefined" && window.location.protocol === "https:" ? "wss" : "ws";
-  return `${protocol}://${resolveHost()}/parties/main/${roomId}`;
+// The realtime room lives on the same origin as the app, served by the Worker
+// under /api/room/<code> (auth-gated, then upgraded to a Durable Object socket).
+function wsUrl(code: string): string {
+  const protocol = window.location.protocol === "https:" ? "wss" : "ws";
+  return `${protocol}://${window.location.host}/api/room/${code}`;
 }
 
 const MAX_BACKOFF_MS = 30_000;
+
+export type RoomError = { message: string; code?: ServerErrorCode; seq: number };
 
 export type RoomConnection = {
   state: GameState | null;
   youId: string;
   connected: boolean;
+  error: RoomError | null;
   send: (msg: ClientMessage) => void;
 };
 
-export function useRoom(roomId: string | null): RoomConnection {
+export function useRoom(code: string | null): RoomConnection {
   const [state, setState] = useState<GameState | null>(null);
   const [youId, setYouId] = useState("");
   const [connected, setConnected] = useState(false);
+  const [error, setError] = useState<RoomError | null>(null);
+  const errSeqRef = useRef(0);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const attemptRef = useRef(0);
   const cancelledRef = useRef(false);
 
   useEffect(() => {
-    if (!roomId) return;
+    if (!code) return;
     cancelledRef.current = false;
     attemptRef.current = 0;
 
     const connect = () => {
       if (cancelledRef.current) return;
-      const ws = new WebSocket(wsUrl(roomId));
+      const ws = new WebSocket(wsUrl(code));
       wsRef.current = ws;
       ws.onopen = () => {
         setConnected(true);
@@ -58,7 +54,11 @@ export function useRoom(roomId: string | null): RoomConnection {
         }
       };
       ws.onerror = () => {
-        try { ws.close(); } catch {}
+        try {
+          ws.close();
+        } catch {
+          // ignore
+        }
       };
       ws.onmessage = (ev: MessageEvent) => {
         try {
@@ -66,8 +66,13 @@ export function useRoom(roomId: string | null): RoomConnection {
           if (msg.type === "state") {
             setState(msg.state);
             setYouId(msg.youId);
+          } else if (msg.type === "error") {
+            errSeqRef.current += 1;
+            setError({ message: msg.message, code: msg.code, seq: errSeqRef.current });
           }
-        } catch {}
+        } catch {
+          // ignore malformed frames
+        }
       };
     };
 
@@ -80,7 +85,7 @@ export function useRoom(roomId: string | null): RoomConnection {
       wsRef.current?.close();
       wsRef.current = null;
     };
-  }, [roomId]);
+  }, [code]);
 
   const send = useCallback((msg: ClientMessage) => {
     const ws = wsRef.current;
@@ -89,5 +94,5 @@ export function useRoom(roomId: string | null): RoomConnection {
     }
   }, []);
 
-  return { state, youId, connected, send };
+  return { state, youId, connected, error, send };
 }

@@ -1,6 +1,4 @@
-"use client";
-
-import type { PhotoEntry } from "./game";
+import type { PhotoEntry } from "@shared/game";
 
 const MAX_DIMENSION = 800;
 const JPEG_QUALITY = 0.78;
@@ -23,33 +21,50 @@ function loadImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-function resizeToDataUrl(src: string, maxDim = MAX_DIMENSION, quality = JPEG_QUALITY): Promise<string> {
+function resizeToBlob(src: string, maxDim = MAX_DIMENSION, quality = JPEG_QUALITY): Promise<Blob> {
   return loadImage(src).then(
     (img) =>
-      new Promise<string>((resolve, reject) => {
+      new Promise<Blob>((resolve, reject) => {
         const ratio = Math.min(1, maxDim / Math.max(img.width, img.height));
         const w = Math.max(1, Math.round(img.width * ratio));
         const h = Math.max(1, Math.round(img.height * ratio));
         const canvas = document.createElement("canvas");
         canvas.width = w;
         canvas.height = h;
-        const ctx = canvas.getContext("2d");
-        if (!ctx) {
+        const c = canvas.getContext("2d");
+        if (!c) {
           reject(new Error("No 2D context"));
           return;
         }
-        ctx.drawImage(img, 0, 0, w, h);
-        resolve(canvas.toDataURL("image/jpeg", quality));
+        c.drawImage(img, 0, 0, w, h);
+        canvas.toBlob(
+          (blob) => (blob ? resolve(blob) : reject(new Error("Encoding failed"))),
+          "image/jpeg",
+          quality
+        );
       })
   );
 }
 
+/** Upload an image blob to R2 via the auth-gated route; returns its object key. */
+async function uploadBlob(blob: Blob): Promise<string> {
+  const res = await fetch("/api/photos", {
+    method: "POST",
+    headers: { "content-type": blob.type || "image/jpeg" },
+    body: blob,
+  });
+  if (!res.ok) throw new Error(`Upload failed (${res.status})`);
+  const { key } = (await res.json()) as { key: string };
+  return key;
+}
+
 export async function fileToPhoto(file: File): Promise<PhotoEntry> {
   const rawUrl = await readFileAsDataUrl(file);
-  const dataUrl = await resizeToDataUrl(rawUrl);
+  const blob = await resizeToBlob(rawUrl);
+  const key = await uploadBlob(blob);
   return {
     id: `ph-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    dataUrl,
+    key,
     where: "",
     when: "",
   };
