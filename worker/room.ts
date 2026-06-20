@@ -1,39 +1,78 @@
 import type { Env } from "./env";
 import type {
+  BalloonState,
+  DoubtGem,
+  ECardKind,
   GameSettings,
   GameState,
   MinigameInput,
   MinigameResult,
   MinigameState,
   Player,
+  QuizRaceState,
   Question,
 } from "@shared/game";
-import { mergeSettings } from "@shared/game";
+import { isQuizRaceId, mergeSettings } from "@shared/game";
 import { fetchTriviaQuestions } from "./trivia";
 import {
+  BALLOON_MAX_SIZE,
+  BALLOON_MS,
+  COLOR_LIE_MS,
+  DOUBT_CALL_MS,
+  DOUBT_CLAIM_MS,
+  DOUBT_GEMS,
+  DOUBT_REVEAL_MS,
+  ECARD_PLAY_MS,
+  ECARD_REVEAL_MS,
   IDLE_CLEANUP_MS,
   MEMORY_LANE_ANSWER_MS,
   MEMORY_LANE_REVEAL_MS,
+  MIRROR_MS,
+  NUMBER_RUSH_MS,
   POST_MINIGAME_MS,
   PLAYER_COLORS,
+  QUIZ_RACE_MS,
+  RPS_CHOOSE_MS,
+  RPS_REVEAL_MS,
   SPEED_SORT_MS,
   STEAL_WINDOW_MS,
+  TOWER_CONFESS_MS,
+  TOWER_READ_MS,
+  TOWER_REVEAL_MS,
   TRIVIA_ANSWER_MS,
   TRIVIA_BUZZ_RAPID_MS,
   TRIVIA_BUZZ_WAGER_MS,
   TRIVIA_REVEAL_MS,
   TRIVIA_WAGER_MS,
   TYPE_RACE_MS,
+  WHACK_MS,
+  balloonPopChance,
   computeResultDeltas,
+  dealECardGame,
   determineWinner,
+  doubtTellerSlot,
+  makeBalloonState,
+  makeColorLieState,
+  makeConfessionState,
+  makeDoubtState,
+  makeECardState,
   makeMemoryLaneState,
+  makeMirrorMatchState,
+  makeNumberRushState,
+  makeQuizRaceState,
   makeReflexState,
+  makeRpsState,
   makeSpeedSortState,
   makeTypeRaceState,
+  makeWhackState,
   newBuzz,
   nowMs,
   pickNextMinigame,
+  randomGem,
+  resolveECardTurn,
+  rpsRoundWinner,
   slotsFrom,
+  towerConfessorSlot,
 } from "./minigames";
 
 type ConnMeta = { playerId: string | null; isHost: boolean };
@@ -47,6 +86,16 @@ type AlarmSpec =
   | { kind: "memory-lane-reveal" }
   | { kind: "reflex-light" }
   | { kind: "reflex-end" }
+  | { kind: "rps-choose-timeout"; round: number }
+  | { kind: "rps-reveal-next"; round: number }
+  | { kind: "ecard-play-timeout"; game: number; turn: number }
+  | { kind: "ecard-reveal-next"; game: number; turn: number }
+  | { kind: "tower-confess-timeout"; round: number }
+  | { kind: "tower-read-timeout"; round: number }
+  | { kind: "tower-reveal-next"; round: number }
+  | { kind: "doubt-claim-timeout"; round: number }
+  | { kind: "doubt-call-timeout"; round: number }
+  | { kind: "doubt-reveal-next"; round: number }
   | { kind: "minigame-end-timer" }
   | { kind: "minigame-end-transition" }
   | { kind: "idle-cleanup" };
@@ -185,6 +234,36 @@ export class GameRoom implements DurableObject {
       case "reflex-end":
         this.endMinigame();
         break;
+      case "rps-choose-timeout":
+        this.onRpsChooseTimeout(spec.round);
+        break;
+      case "rps-reveal-next":
+        this.onRpsRevealNext(spec.round);
+        break;
+      case "ecard-play-timeout":
+        this.onECardPlayTimeout(spec.game, spec.turn);
+        break;
+      case "ecard-reveal-next":
+        this.onECardRevealNext(spec.game, spec.turn);
+        break;
+      case "tower-confess-timeout":
+        this.onTowerConfessTimeout(spec.round);
+        break;
+      case "tower-read-timeout":
+        this.onTowerReadTimeout(spec.round);
+        break;
+      case "tower-reveal-next":
+        this.onTowerRevealNext(spec.round);
+        break;
+      case "doubt-claim-timeout":
+        this.onDoubtClaimTimeout(spec.round);
+        break;
+      case "doubt-call-timeout":
+        this.onDoubtCallTimeout(spec.round);
+        break;
+      case "doubt-reveal-next":
+        this.onDoubtRevealNext(spec.round);
+        break;
       case "minigame-end-timer":
         this.endMinigame();
         break;
@@ -199,16 +278,66 @@ export class GameRoom implements DurableObject {
     }
   }
 
-  private publicState(): GameState {
+  // Build the state to send to one viewer. `viewerId` is the recipient's
+  // playerId (null for spectators / the host scoreboard). Hidden-information
+  // games mask secrets per viewer so only the player who "owns" a secret sees it.
+  private publicState(viewerId: string | null = null): GameState {
     const state = this.data.state;
     const mg = state.minigame;
+    if (!mg) return { ...state };
 
     // Don't leak the answer key: mask every question's correctIndex except the
     // one currently being revealed. (Photos are just R2 keys, safe to send.)
-    if (mg && mg.id === "trivia") {
+    if (mg.id === "trivia") {
       const revealIndex = mg.phase === "reveal" ? mg.questionIndex : -1;
       const questions = mg.questions.map((q, i) => (i === revealIndex ? q : { ...q, correctIndex: -1 }));
       return { ...state, minigame: { ...mg, questions } };
+    }
+
+    // Quiz-race: never ship the answer key to clients.
+    if (isQuizRaceId(mg.id)) {
+      const q = mg as QuizRaceState;
+      const rounds = q.rounds.map((r) => ({ ...r, correctIndex: -1 }));
+      return { ...state, minigame: { ...q, rounds } };
+    }
+
+    const viewerKey =
+      "slots" in mg && viewerId
+        ? mg.slots.p1 === viewerId
+          ? "p1"
+          : mg.slots.p2 === viewerId
+            ? "p2"
+            : null
+        : null;
+
+    if (mg.id === "e-card") {
+      // Hide each player's face-down card from the opponent until reveal.
+      const played =
+        mg.phase === "reveal"
+          ? mg.played
+          : {
+              p1: viewerKey === "p1" ? mg.played.p1 : null,
+              p2: viewerKey === "p2" ? mg.played.p2 : null,
+            };
+      return { ...state, minigame: { ...mg, played } };
+    }
+
+    if (mg.id === "tower") {
+      // Only the confessor (the one who set it) sees the secret before reveal.
+      const showSecret = mg.phase === "reveal" || viewerKey === mg.confessorSlot;
+      return { ...state, minigame: { ...mg, secret: showSecret ? mg.secret : null } };
+    }
+
+    if (mg.id === "doubt") {
+      // Only the teller sees the gem before reveal.
+      const showSecret = mg.phase === "reveal" || viewerKey === mg.tellerSlot;
+      return { ...state, minigame: { ...mg, secret: showSecret ? mg.secret : null } };
+    }
+
+    if (mg.id === "color-lie") {
+      // Mask the answer key; the revealed prompt's answer rides in lastResult.
+      const rounds = mg.rounds.map((r) => ({ ...r, correctIndex: -1 }));
+      return { ...state, minigame: { ...mg, rounds } };
     }
 
     return { ...state };
@@ -231,10 +360,10 @@ export class GameRoom implements DurableObject {
   }
 
   private broadcast() {
-    const payload = this.publicState();
     for (const ws of this.state.getWebSockets()) {
       const meta = ws.deserializeAttachment() as ConnMeta | null;
-      this.sendTo(ws, { type: "state", state: payload, youId: meta?.playerId ?? "" });
+      const youId = meta?.playerId ?? "";
+      this.sendTo(ws, { type: "state", state: this.publicState(meta?.playerId ?? null), youId });
     }
   }
 
@@ -344,6 +473,43 @@ export class GameRoom implements DurableObject {
       case "type-race":
         state = makeTypeRaceState(slots);
         break;
+      case "math-duel":
+      case "stroop":
+      case "odd-one-out":
+      case "emoji-decode":
+      case "flag-quiz":
+      case "word-match":
+      case "true-false":
+      case "compare":
+        state = makeQuizRaceState(id, slots);
+        break;
+      case "whack":
+        state = makeWhackState(slots);
+        break;
+      case "number-rush":
+        state = makeNumberRushState(slots);
+        break;
+      case "rps":
+        state = makeRpsState(slots);
+        break;
+      case "balloon":
+        state = makeBalloonState(slots);
+        break;
+      case "e-card":
+        state = makeECardState(slots);
+        break;
+      case "tower":
+        state = makeConfessionState(slots);
+        break;
+      case "mirror-match":
+        state = makeMirrorMatchState(slots);
+        break;
+      case "doubt":
+        state = makeDoubtState(slots);
+        break;
+      case "color-lie":
+        state = makeColorLieState(slots);
+        break;
     }
     this.data.state.minigame = state;
     this.commit({ phase: "minigame-active", minigame: state });
@@ -414,6 +580,82 @@ export class GameRoom implements DurableObject {
         void this.scheduleAlarm({ kind: "minigame-end-timer" }, TYPE_RACE_MS);
         return;
       }
+      case "math-duel":
+      case "stroop":
+      case "odd-one-out":
+      case "emoji-decode":
+      case "flag-quiz":
+      case "word-match":
+      case "true-false":
+      case "compare": {
+        this.commit({
+          minigame: { ...mg, startedAt: nowMs(), duration: QUIZ_RACE_MS, status: "live" },
+        });
+        this.broadcast();
+        void this.scheduleAlarm({ kind: "minigame-end-timer" }, QUIZ_RACE_MS);
+        return;
+      }
+      case "whack": {
+        this.commit({
+          minigame: { ...mg, startedAt: nowMs(), duration: WHACK_MS, status: "live" },
+        });
+        this.broadcast();
+        void this.scheduleAlarm({ kind: "minigame-end-timer" }, WHACK_MS);
+        return;
+      }
+      case "number-rush": {
+        this.commit({
+          minigame: { ...mg, startedAt: nowMs(), duration: NUMBER_RUSH_MS, status: "live" },
+        });
+        this.broadcast();
+        void this.scheduleAlarm({ kind: "minigame-end-timer" }, NUMBER_RUSH_MS);
+        return;
+      }
+      case "balloon": {
+        this.commit({
+          minigame: { ...mg, startedAt: nowMs(), duration: BALLOON_MS, status: "live" },
+        });
+        this.broadcast();
+        void this.scheduleAlarm({ kind: "minigame-end-timer" }, BALLOON_MS);
+        return;
+      }
+      case "rps": {
+        this.commit({ minigame: { ...mg, status: "live", phase: "choosing" } });
+        this.broadcast();
+        void this.scheduleAlarm({ kind: "rps-choose-timeout", round: mg.round }, RPS_CHOOSE_MS);
+        return;
+      }
+      case "e-card": {
+        this.broadcast();
+        void this.scheduleAlarm({ kind: "ecard-play-timeout", game: mg.game, turn: mg.turn }, ECARD_PLAY_MS);
+        return;
+      }
+      case "tower": {
+        this.broadcast();
+        void this.scheduleAlarm({ kind: "tower-confess-timeout", round: mg.round }, TOWER_CONFESS_MS);
+        return;
+      }
+      case "doubt": {
+        this.broadcast();
+        void this.scheduleAlarm({ kind: "doubt-claim-timeout", round: mg.round }, DOUBT_CLAIM_MS);
+        return;
+      }
+      case "mirror-match": {
+        this.commit({
+          minigame: { ...mg, startedAt: nowMs(), duration: MIRROR_MS, status: "live" },
+        });
+        this.broadcast();
+        void this.scheduleAlarm({ kind: "minigame-end-timer" }, MIRROR_MS);
+        return;
+      }
+      case "color-lie": {
+        this.commit({
+          minigame: { ...mg, startedAt: nowMs(), duration: COLOR_LIE_MS, status: "live" },
+        });
+        this.broadcast();
+        void this.scheduleAlarm({ kind: "minigame-end-timer" }, COLOR_LIE_MS);
+        return;
+      }
     }
   }
 
@@ -426,15 +668,383 @@ export class GameRoom implements DurableObject {
     void this.scheduleAlarm({ kind: "reflex-end" }, cfg.durationMs);
   }
 
+  // ─── Rock-paper-scissors flow ──────────────────────────────────────────
+
+  private onRpsChoose(playerId: string, choice: import("@shared/game").RpsChoice) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "rps" || mg.phase !== "choosing" || mg.status !== "live") return;
+    const key = this.slotKey(mg, playerId);
+    if (!key) return;
+    if (mg.choices[key]) return; // locked in for this round
+    const choices = { ...mg.choices, [key]: choice };
+    this.commit({ minigame: { ...mg, choices } }, { skipSave: true });
+    this.broadcast();
+    if (choices.p1 && choices.p2) {
+      void this.clearAlarm();
+      this.resolveRpsRound();
+    }
+  }
+
+  private onRpsChooseTimeout(round: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "rps" || mg.phase !== "choosing" || mg.round !== round) return;
+    // Anyone who didn't pick forfeits the round with a null choice.
+    this.resolveRpsRound();
+  }
+
+  private resolveRpsRound() {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "rps") return;
+    const winner = rpsRoundWinner(mg.choices.p1, mg.choices.p2);
+    const wins = { ...mg.wins };
+    if (winner) wins[winner] += 1;
+    const need = Math.floor(mg.bestOf / 2) + 1;
+    const roundsPlayed = mg.round + 1;
+    const decided = wins.p1 >= need || wins.p2 >= need || roundsPlayed >= mg.bestOf;
+    this.commit({
+      minigame: {
+        ...mg,
+        wins,
+        phase: "reveal",
+        reveal: {
+          p1: mg.choices.p1 ?? "rock",
+          p2: mg.choices.p2 ?? "rock",
+          winner,
+        },
+        winnerId: decided
+          ? wins.p1 > wins.p2
+            ? mg.slots.p1
+            : wins.p2 > wins.p1
+              ? mg.slots.p2
+              : null
+          : null,
+      },
+    });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "rps-reveal-next", round: mg.round }, RPS_REVEAL_MS);
+  }
+
+  private onRpsRevealNext(round: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "rps" || mg.phase !== "reveal" || mg.round !== round) return;
+    const need = Math.floor(mg.bestOf / 2) + 1;
+    const roundsPlayed = mg.round + 1;
+    if (mg.wins.p1 >= need || mg.wins.p2 >= need || roundsPlayed >= mg.bestOf) {
+      this.endMinigame();
+      return;
+    }
+    const nextRound = mg.round + 1;
+    this.commit({
+      minigame: { ...mg, round: nextRound, phase: "choosing", choices: { p1: null, p2: null }, reveal: null },
+    });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "rps-choose-timeout", round: nextRound }, RPS_CHOOSE_MS);
+  }
+
+  // ─── E-Card flow ───────────────────────────────────────────────────────
+  private onECardPlay(playerId: string, card: ECardKind) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "e-card" || mg.phase !== "playing" || mg.status !== "live") return;
+    const key = this.slotKey(mg, playerId);
+    if (!key || mg.locked[key]) return;
+    const hand = mg.hands[key];
+    const idx = hand.indexOf(card);
+    if (idx === -1) return; // card not in hand
+    const newHand = hand.slice();
+    newHand.splice(idx, 1);
+    const locked = { ...mg.locked, [key]: true };
+    this.commit(
+      {
+        minigame: {
+          ...mg,
+          played: { ...mg.played, [key]: card },
+          locked,
+          hands: { ...mg.hands, [key]: newHand },
+        },
+      },
+      { skipSave: true }
+    );
+    this.broadcast();
+    if (locked.p1 && locked.p2) {
+      void this.clearAlarm();
+      this.resolveECardSet();
+    }
+  }
+
+  private onECardPlayTimeout(game: number, turn: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "e-card" || mg.phase !== "playing" || mg.game !== game || mg.turn !== turn) return;
+    // Auto-play for anyone who stalled: prefer a citizen, else the first card.
+    const played = { ...mg.played };
+    const locked = { ...mg.locked };
+    const hands = { p1: mg.hands.p1.slice(), p2: mg.hands.p2.slice() };
+    for (const key of ["p1", "p2"] as const) {
+      if (locked[key]) continue;
+      const hand = hands[key];
+      if (hand.length === 0) continue;
+      const ci = hand.indexOf("citizen");
+      const idx = ci !== -1 ? ci : 0;
+      played[key] = hand[idx];
+      locked[key] = true;
+      hand.splice(idx, 1);
+    }
+    this.data.state.minigame = { ...mg, played, locked, hands };
+    this.resolveECardSet();
+  }
+
+  private resolveECardSet() {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "e-card") return;
+    const slaveSlot = mg.emperorSlot === "p1" ? "p2" : "p1";
+    const emperorCard = mg.played[mg.emperorSlot] ?? "citizen";
+    const slaveCard = mg.played[slaveSlot] ?? "citizen";
+    const outcome = resolveECardTurn(emperorCard, slaveCard);
+    this.commit({
+      minigame: { ...mg, phase: "reveal", reveal: { emperor: emperorCard, slave: slaveCard, outcome } },
+    });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "ecard-reveal-next", game: mg.game, turn: mg.turn }, ECARD_REVEAL_MS);
+  }
+
+  private onECardRevealNext(game: number, turn: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "e-card" || mg.phase !== "reveal" || mg.game !== game || mg.turn !== turn) return;
+    const reveal = mg.reveal!;
+    const slaveSlot = mg.emperorSlot === "p1" ? "p2" : "p1";
+    const handsEmpty = mg.hands.p1.length === 0 && mg.hands.p2.length === 0;
+
+    // A draw with cards left → keep playing the same sub-game.
+    if (reveal.outcome === "draw" && !handsEmpty) {
+      const nextTurn = mg.turn + 1;
+      this.commit({
+        minigame: {
+          ...mg,
+          turn: nextTurn,
+          phase: "playing",
+          played: { p1: null, p2: null },
+          locked: { p1: false, p2: false },
+          reveal: null,
+        },
+      });
+      this.broadcast();
+      void this.scheduleAlarm({ kind: "ecard-play-timeout", game: mg.game, turn: nextTurn }, ECARD_PLAY_MS);
+      return;
+    }
+
+    // Award the sub-game: Emperor win = 1, Slave upset = 2. (Exhausted → Emperor.)
+    const points = { ...mg.points };
+    if (reveal.outcome === "slave-win") points[slaveSlot] += 2;
+    else points[mg.emperorSlot] += 1;
+
+    if (mg.game + 1 >= mg.totalGames) {
+      this.commit({ minigame: { ...mg, points } });
+      this.endMinigame();
+      return;
+    }
+    const deal = dealECardGame(mg.emperorSlot === "p1" ? "p2" : "p1");
+    this.commit({
+      minigame: {
+        ...mg,
+        game: mg.game + 1,
+        turn: 0,
+        emperorSlot: deal.emperorSlot,
+        hands: deal.hands,
+        played: { p1: null, p2: null },
+        locked: { p1: false, p2: false },
+        reveal: null,
+        phase: "playing",
+        points,
+      },
+    });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "ecard-play-timeout", game: mg.game + 1, turn: 0 }, ECARD_PLAY_MS);
+  }
+
+  // ─── Tower of Confession flow ──────────────────────────────────────────
+  private onTowerConfess(playerId: string, value: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "tower" || mg.phase !== "confess" || mg.status !== "live") return;
+    if (this.slotKey(mg, playerId) !== mg.confessorSlot) return;
+    const secret = Math.max(0, Math.min(9, Math.floor(value)));
+    void this.clearAlarm();
+    this.commit({ minigame: { ...mg, secret, phase: "read" } });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "tower-read-timeout", round: mg.round }, TOWER_READ_MS);
+  }
+
+  private onTowerConfessTimeout(round: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "tower" || mg.phase !== "confess" || mg.round !== round) return;
+    const secret = Math.floor(Math.random() * 10);
+    this.commit({ minigame: { ...mg, secret, phase: "read" } });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "tower-read-timeout", round: mg.round }, TOWER_READ_MS);
+  }
+
+  private onTowerRead(playerId: string, value: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "tower" || mg.phase !== "read" || mg.status !== "live") return;
+    const readerSlot = mg.confessorSlot === "p1" ? "p2" : "p1";
+    if (this.slotKey(mg, playerId) !== readerSlot) return;
+    void this.clearAlarm();
+    this.resolveTowerRound(Math.max(0, Math.min(9, Math.floor(value))));
+  }
+
+  private onTowerReadTimeout(round: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "tower" || mg.phase !== "read" || mg.round !== round) return;
+    // Reader stalled → worst possible guess (max gap from the secret).
+    const secret = mg.secret ?? 0;
+    this.resolveTowerRound(secret <= 4 ? 9 : 0);
+  }
+
+  private resolveTowerRound(guess: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "tower") return;
+    const secret = mg.secret ?? 0;
+    const readerSlot = mg.confessorSlot === "p1" ? "p2" : "p1";
+    const gap = Math.abs(secret - guess);
+    const readerGain = 9 - gap; // closer reads score more
+    const confessorGain = gap; // a well-hidden secret rewards the confessor
+    const points = { ...mg.points };
+    points[readerSlot] += readerGain;
+    points[mg.confessorSlot] += confessorGain;
+    this.commit({
+      minigame: {
+        ...mg,
+        guess,
+        phase: "reveal",
+        points,
+        lastResult: { secret, guess, gap, readerGain, confessorGain },
+      },
+    });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "tower-reveal-next", round: mg.round }, TOWER_REVEAL_MS);
+  }
+
+  private onTowerRevealNext(round: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "tower" || mg.phase !== "reveal" || mg.round !== round) return;
+    if (mg.round + 1 >= mg.totalRounds) {
+      this.endMinigame();
+      return;
+    }
+    const nextRound = mg.round + 1;
+    this.commit({
+      minigame: {
+        ...mg,
+        round: nextRound,
+        confessorSlot: towerConfessorSlot(nextRound),
+        secret: null,
+        guess: null,
+        phase: "confess",
+        lastResult: null,
+      },
+    });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "tower-confess-timeout", round: nextRound }, TOWER_CONFESS_MS);
+  }
+
+  // ─── Doubt flow ────────────────────────────────────────────────────────
+  private onDoubtClaim(playerId: string, gem: DoubtGem) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "doubt" || mg.phase !== "claim" || mg.status !== "live") return;
+    if (this.slotKey(mg, playerId) !== mg.tellerSlot) return;
+    if (!DOUBT_GEMS.includes(gem)) return;
+    void this.clearAlarm();
+    this.commit({ minigame: { ...mg, claim: gem, phase: "call" } });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "doubt-call-timeout", round: mg.round }, DOUBT_CALL_MS);
+  }
+
+  private onDoubtClaimTimeout(round: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "doubt" || mg.phase !== "claim" || mg.round !== round) return;
+    // Teller stalled → claim the truth.
+    this.commit({ minigame: { ...mg, claim: mg.secret, phase: "call" } });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "doubt-call-timeout", round: mg.round }, DOUBT_CALL_MS);
+  }
+
+  private onDoubtCall(playerId: string, doubt: boolean) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "doubt" || mg.phase !== "call" || mg.status !== "live") return;
+    const callerSlot = mg.tellerSlot === "p1" ? "p2" : "p1";
+    if (this.slotKey(mg, playerId) !== callerSlot) return;
+    void this.clearAlarm();
+    this.resolveDoubtRound(doubt);
+  }
+
+  private onDoubtCallTimeout(round: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "doubt" || mg.phase !== "call" || mg.round !== round) return;
+    this.resolveDoubtRound(false); // stalled → trust
+  }
+
+  private resolveDoubtRound(doubted: boolean) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "doubt") return;
+    const callerSlot = mg.tellerSlot === "p1" ? "p2" : "p1";
+    const secret = mg.secret ?? "ruby";
+    const claim = mg.claim ?? secret;
+    const lie = claim !== secret;
+    const callerWon = doubted === lie; // doubt a lie, or trust the truth → caller wins
+    const scores = { ...mg.scores };
+    if (callerWon) scores[callerSlot] += 1;
+    else scores[mg.tellerSlot] += 1;
+    this.commit({
+      minigame: {
+        ...mg,
+        doubted,
+        phase: "reveal",
+        scores,
+        lastResult: { secret, claim, lie, doubted, callerWon },
+      },
+    });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "doubt-reveal-next", round: mg.round }, DOUBT_REVEAL_MS);
+  }
+
+  private onDoubtRevealNext(round: number) {
+    const mg = this.data.state.minigame;
+    if (!mg || mg.id !== "doubt" || mg.phase !== "reveal" || mg.round !== round) return;
+    if (mg.round + 1 >= mg.totalRounds) {
+      this.endMinigame();
+      return;
+    }
+    const nextRound = mg.round + 1;
+    this.commit({
+      minigame: {
+        ...mg,
+        round: nextRound,
+        tellerSlot: doubtTellerSlot(nextRound),
+        secret: randomGem(),
+        claim: null,
+        doubted: null,
+        phase: "claim",
+        lastResult: null,
+      },
+    });
+    this.broadcast();
+    void this.scheduleAlarm({ kind: "doubt-claim-timeout", round: nextRound }, DOUBT_CLAIM_MS);
+  }
+
   private endMinigame() {
     const mg = this.data.state.minigame;
     if (!mg) return;
     void this.clearAlarm();
-    const winnerId = determineWinner(mg);
-    if (winnerId) {
-      const stored = this.data.playersById[winnerId];
-      if (stored) stored.score += 1;
-      this.refreshPlayersList();
+    let winnerId: string | null;
+    if (mg.id === "balloon") {
+      // Balloon scores live (banking adds points, a pop subtracts them), so the
+      // winner is whoever netted more this round — no extra flat point.
+      winnerId = this.balloonNetWinner(mg);
+    } else {
+      winnerId = determineWinner(mg);
+      if (winnerId) {
+        const stored = this.data.playersById[winnerId];
+        if (stored) stored.score += 1;
+        this.refreshPlayersList();
+      }
     }
     const id = this.data.state.currentMinigame;
     if (id && !this.data.state.playedMinigames.includes(id)) {
@@ -452,6 +1062,18 @@ export class GameRoom implements DurableObject {
     });
     this.broadcast();
     void this.scheduleAlarm({ kind: "minigame-end-transition" }, POST_MINIGAME_MS);
+  }
+
+  // Balloon winner = whoever gained the most score this round (banked minus
+  // popped), read from the start-of-round snapshot.
+  private balloonNetWinner(mg: BalloonState): string | null {
+    const start = this.data.minigameScoresAtStart;
+    const net = (id: string) => (this.data.playersById[id]?.score ?? 0) - (start[id] ?? 0);
+    const d1 = net(mg.slots.p1);
+    const d2 = net(mg.slots.p2);
+    if (d1 > d2) return mg.slots.p1;
+    if (d2 > d1) return mg.slots.p2;
+    return null;
   }
 
   private afterMinigameEnd() {
@@ -798,13 +1420,231 @@ export class GameRoom implements DurableObject {
         if (finishedAt.p1 !== null && finishedAt.p2 !== null) this.endMinigame();
         return;
       }
+      case "quiz-answer": {
+        if (!isQuizRaceId(mg.id)) return;
+        const q = mg as QuizRaceState;
+        if (q.status !== "live") return;
+        const key = this.slotKey(q, playerId);
+        if (!key) return;
+        const idx = q.progress[key];
+        const round = q.rounds[idx];
+        if (!round) return; // ran out of questions (shouldn't happen within the timer)
+        const isCorrect = input.index === round.correctIndex;
+        const correct = { ...q.correct };
+        if (isCorrect) correct[key] += 1;
+        this.commit(
+          {
+            minigame: {
+              ...q,
+              progress: { ...q.progress, [key]: idx + 1 },
+              correct,
+              lastCorrect: { ...q.lastCorrect, [key]: isCorrect },
+            },
+          },
+          { skipSave: true }
+        );
+        this.broadcast();
+        return;
+      }
+      case "whack-tap": {
+        if (mg.id !== "whack" || mg.status !== "live") return;
+        const key = this.slotKey(mg, playerId);
+        if (!key) return;
+        // Only a tap on the player's current mole cell counts.
+        if (mg.sequence[mg.progress[key]] !== input.cell) return;
+        this.commit(
+          { minigame: { ...mg, progress: { ...mg.progress, [key]: mg.progress[key] + 1 } } },
+          { skipSave: true }
+        );
+        this.broadcast();
+        return;
+      }
+      case "number-rush-tap": {
+        if (mg.id !== "number-rush" || mg.status !== "live") return;
+        const key = this.slotKey(mg, playerId);
+        if (!key) return;
+        // The next number a player needs is progress+1; ignore anything else.
+        if (input.value !== mg.progress[key] + 1) return;
+        const next = mg.progress[key] + 1;
+        this.commit(
+          { minigame: { ...mg, progress: { ...mg.progress, [key]: next } } },
+          { skipSave: true }
+        );
+        this.broadcast();
+        if (next >= mg.size) this.endMinigame();
+        return;
+      }
+      case "rps-choose":
+        this.onRpsChoose(playerId, input.choice);
+        return;
+      case "balloon-pump": {
+        if (mg.id !== "balloon" || mg.status !== "live") return;
+        const key = this.slotKey(mg, playerId);
+        if (!key) return;
+        const popped = Math.random() < balloonPopChance(mg.size[key]);
+        if (popped) {
+          // A pop costs the un-banked size off the player's real score.
+          const lost = mg.size[key];
+          const stored = this.data.playersById[playerId];
+          if (stored) stored.score = Math.max(0, stored.score - lost);
+          this.refreshPlayersList();
+          this.commit(
+            {
+              minigame: {
+                ...mg,
+                size: { ...mg.size, [key]: 0 },
+                pops: { ...mg.pops, [key]: mg.pops[key] + 1 },
+                justPopped: { ...mg.justPopped, [key]: true },
+                lastPopSize: { ...mg.lastPopSize, [key]: lost },
+              },
+            },
+            { skipSave: true }
+          );
+        } else {
+          this.commit(
+            {
+              minigame: {
+                ...mg,
+                size: { ...mg.size, [key]: Math.min(BALLOON_MAX_SIZE, mg.size[key] + 1) },
+                justPopped: { ...mg.justPopped, [key]: false },
+              },
+            },
+            { skipSave: true }
+          );
+        }
+        this.broadcast();
+        return;
+      }
+      case "balloon-bank": {
+        if (mg.id !== "balloon" || mg.status !== "live") return;
+        const key = this.slotKey(mg, playerId);
+        if (!key || mg.size[key] === 0) return;
+        // Banking locks the un-banked size into the player's real score.
+        const gained = mg.size[key];
+        const stored = this.data.playersById[playerId];
+        if (stored) stored.score += gained;
+        this.refreshPlayersList();
+        this.commit(
+          {
+            minigame: {
+              ...mg,
+              banked: { ...mg.banked, [key]: mg.banked[key] + gained },
+              size: { ...mg.size, [key]: 0 },
+              justPopped: { ...mg.justPopped, [key]: false },
+            },
+          },
+          { skipSave: true }
+        );
+        this.broadcast();
+        return;
+      }
+      case "ecard-play":
+        this.onECardPlay(playerId, input.card);
+        return;
+      case "tower-confess":
+        this.onTowerConfess(playerId, input.value);
+        return;
+      case "tower-read":
+        this.onTowerRead(playerId, input.value);
+        return;
+      case "doubt-claim":
+        this.onDoubtClaim(playerId, input.gem);
+        return;
+      case "doubt-call":
+        this.onDoubtCall(playerId, input.doubt);
+        return;
+      case "mirror-tap": {
+        if (mg.id !== "mirror-match" || mg.status !== "live") return;
+        const key = this.slotKey(mg, playerId);
+        if (!key) return;
+        if (input.pad === mg.sequence[mg.pos[key]]) {
+          const newPos = mg.pos[key] + 1;
+          if (newPos >= mg.level[key]) {
+            // Cleared the current level → bank it and grow the next one.
+            this.commit(
+              {
+                minigame: {
+                  ...mg,
+                  cleared: { ...mg.cleared, [key]: mg.level[key] },
+                  level: { ...mg.level, [key]: mg.level[key] + 1 },
+                  pos: { ...mg.pos, [key]: 0 },
+                },
+              },
+              { skipSave: true }
+            );
+          } else {
+            this.commit({ minigame: { ...mg, pos: { ...mg.pos, [key]: newPos } } }, { skipSave: true });
+          }
+        } else {
+          // Wrong pad → strike and restart the current level.
+          this.commit(
+            {
+              minigame: {
+                ...mg,
+                strikes: { ...mg.strikes, [key]: mg.strikes[key] + 1 },
+                pos: { ...mg.pos, [key]: 0 },
+              },
+            },
+            { skipSave: true }
+          );
+        }
+        this.broadcast();
+        return;
+      }
+      case "color-lie-tap": {
+        if (mg.id !== "color-lie" || mg.status !== "live") return;
+        const key = this.slotKey(mg, playerId);
+        if (!key || input.index !== mg.index || mg.lockedOut[key]) return;
+        const round = mg.rounds[mg.index];
+        if (!round) return;
+        if (input.optionIndex === round.correctIndex) {
+          const nextIndex = mg.index + 1;
+          this.commit(
+            {
+              minigame: {
+                ...mg,
+                scores: { ...mg.scores, [key]: mg.scores[key] + 1 },
+                index: nextIndex,
+                lockedOut: { p1: false, p2: false },
+                lastResult: { winner: key, correctIndex: round.correctIndex },
+              },
+            },
+            { skipSave: true }
+          );
+          this.broadcast();
+          if (nextIndex >= mg.rounds.length) this.endMinigame();
+          return;
+        }
+        // Wrong tap → locked out of this prompt. If both miss, the prompt passes.
+        const lockedOut = { ...mg.lockedOut, [key]: true };
+        if (lockedOut.p1 && lockedOut.p2) {
+          const nextIndex = mg.index + 1;
+          this.commit(
+            {
+              minigame: {
+                ...mg,
+                index: nextIndex,
+                lockedOut: { p1: false, p2: false },
+                lastResult: { winner: null, correctIndex: round.correctIndex },
+              },
+            },
+            { skipSave: true }
+          );
+          this.broadcast();
+          if (nextIndex >= mg.rounds.length) this.endMinigame();
+          return;
+        }
+        this.commit({ minigame: { ...mg, lockedOut } }, { skipSave: true });
+        this.broadcast();
+        return;
+      }
     }
   }
 
   // Which fixed slot a player occupies in a head-to-head minigame, or null if
   // they aren't one of the two competitors.
   private slotKey(mg: MinigameState, playerId: string): "p1" | "p2" | null {
-    if (mg.id !== "reflex" && mg.id !== "speed-sort" && mg.id !== "type-race") return null;
+    if (!("slots" in mg)) return null;
     if (mg.slots.p1 === playerId) return "p1";
     if (mg.slots.p2 === playerId) return "p2";
     return null;

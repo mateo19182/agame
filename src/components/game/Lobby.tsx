@@ -65,13 +65,11 @@ function LobbyOptions({ send }: { send: Send }) {
   const [settings] = useState(loadSettings);
   const hasPhotos = memoryLaneHasContent(settings.minigames["memory-lane"].photos);
 
-  const [enabled, setEnabled] = useState<Record<MinigameId, boolean>>({
-    trivia: true,
-    "memory-lane": hasPhotos,
-    reflex: true,
-    "speed-sort": true,
-    "type-race": true,
-  });
+  const [enabled, setEnabled] = useState<Record<MinigameId, boolean>>(() =>
+    Object.fromEntries(
+      MINIGAME_META.map((m) => [m.id, m.id === "memory-lane" ? hasPhotos : true])
+    ) as Record<MinigameId, boolean>
+  );
   const [matchLength, setMatchLength] = useState(settings.matchLength);
   const [allowRepeats, setAllowRepeats] = useState(settings.allowRepeats);
 
@@ -108,7 +106,7 @@ function LobbyOptions({ send }: { send: Send }) {
                   onClick={() => setEnabled((e) => ({ ...e, [m.id]: !e[m.id] }))}
                   className={`w-full text-left px-3 py-2.5 rounded-2xl border transition ${checked ? "border-[color:var(--accent)] bg-[color:var(--accent)]/10" : "border-white/10 hover:border-white/20"}`}
                 >
-                  <div className="font-semibold">{m.label}</div>
+                  <div className="font-semibold">{m.emoji} {m.label}</div>
                   <div className="text-xs text-[color:var(--muted)] mt-0.5">{m.description}</div>
                   {m.id === "memory-lane" && !hasPhotos && (
                     <div className="text-[10px] text-[color:var(--accent-3)] mt-0.5">Add photos in Settings to enable</div>

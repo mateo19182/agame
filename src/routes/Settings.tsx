@@ -64,6 +64,7 @@ export default function Settings() {
             onChange={(patch) => updateMinigame("speed-sort", patch)}
           />
           <TypeRaceConfigCard />
+          <QuickPlayCard />
         </div>
 
         <Section title="Match defaults">
@@ -168,9 +169,7 @@ function Card({ id, title, description, children }: { id: MinigameId; title: str
           <div className="text-lg font-black">{title}</div>
           <div className="text-xs text-[color:var(--muted)] mt-0.5">{description}</div>
         </div>
-        <div className="text-2xl">
-          {meta.id === "trivia" ? "🧠" : meta.id === "memory-lane" ? "📸" : meta.id === "reflex" ? "⚡" : meta.id === "speed-sort" ? "🍎" : "⌨️"}
-        </div>
+        <div className="text-2xl">{meta.emoji}</div>
       </div>
       <div className="mt-4 space-y-3">{children}</div>
     </div>
@@ -393,5 +392,51 @@ function TypeRaceConfigCard() {
     <Card id="type-race" title="Type Race" description="Type the phrase fastest.">
       <div className="text-sm text-[color:var(--muted)]">A random sweet phrase is picked each round. Nothing to configure.</div>
     </Card>
+  );
+}
+
+// The newer head-to-head minigames need no setup — just list them so the host
+// knows what's available to toggle on in the lobby.
+function QuickPlayCard() {
+  const quickIds = new Set<MinigameId>([
+    "math-duel",
+    "stroop",
+    "odd-one-out",
+    "emoji-decode",
+    "flag-quiz",
+    "word-match",
+    "true-false",
+    "compare",
+    "whack",
+    "number-rush",
+    "rps",
+    "balloon",
+    "e-card",
+    "tower",
+    "mirror-match",
+    "doubt",
+    "color-lie",
+  ]);
+  const games = MINIGAME_META.filter((m) => quickIds.has(m.id));
+  return (
+    <div className="glass rounded-3xl p-5">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-lg font-black">Quick-play minigames</div>
+          <div className="text-xs text-[color:var(--muted)] mt-0.5">
+            No setup needed — toggle these on in the lobby.
+          </div>
+        </div>
+        <div className="text-2xl">🎲</div>
+      </div>
+      <div className="mt-4 grid grid-cols-1 sm:grid-cols-2 gap-2">
+        {games.map((m) => (
+          <div key={m.id} className="flex items-center gap-2 text-sm">
+            <span className="text-xl">{m.emoji}</span>
+            <span className="font-semibold">{m.label}</span>
+          </div>
+        ))}
+      </div>
+    </div>
   );
 }

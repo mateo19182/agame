@@ -13,6 +13,17 @@ import { MemoryLaneActive } from "./MemoryLaneActive";
 import { ReflexActive } from "./ReflexActive";
 import { SpeedSortActive } from "./SpeedSortActive";
 import { TypeRaceActive } from "./TypeRaceActive";
+import { QuizRaceActive } from "./QuizRaceActive";
+import { WhackActive } from "./WhackActive";
+import { NumberRushActive } from "./NumberRushActive";
+import { RpsActive } from "./RpsActive";
+import { BalloonActive } from "./BalloonActive";
+import { ECardActive } from "./ECardActive";
+import { TowerActive } from "./TowerActive";
+import { MirrorMatchActive } from "./MirrorMatchActive";
+import { DoubtActive } from "./DoubtActive";
+import { ColorLieActive } from "./ColorLieActive";
+import { isQuizRaceId } from "@shared/game";
 import type { ActiveProps, Role, Send } from "./types";
 
 type Props = {
@@ -68,7 +79,17 @@ function MinigameActive(props: ActiveProps) {
   if (mg.id === "memory-lane") return <MemoryLaneActive {...props} />;
   if (mg.id === "reflex") return <ReflexActive {...props} />;
   if (mg.id === "speed-sort") return <SpeedSortActive {...props} />;
-  return <TypeRaceActive {...props} />;
+  if (mg.id === "type-race") return <TypeRaceActive {...props} />;
+  if (isQuizRaceId(mg.id)) return <QuizRaceActive {...props} />;
+  if (mg.id === "whack") return <WhackActive {...props} />;
+  if (mg.id === "number-rush") return <NumberRushActive {...props} />;
+  if (mg.id === "rps") return <RpsActive {...props} />;
+  if (mg.id === "e-card") return <ECardActive {...props} />;
+  if (mg.id === "tower") return <TowerActive {...props} />;
+  if (mg.id === "mirror-match") return <MirrorMatchActive {...props} />;
+  if (mg.id === "doubt") return <DoubtActive {...props} />;
+  if (mg.id === "color-lie") return <ColorLieActive {...props} />;
+  return <BalloonActive {...props} />;
 }
 
 export type { Props as GameViewProps, Send };
