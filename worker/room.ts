@@ -319,7 +319,14 @@ export class GameRoom implements DurableObject {
               p1: viewerKey === "p1" ? mg.played.p1 : null,
               p2: viewerKey === "p2" ? mg.played.p2 : null,
             };
-      return { ...state, minigame: { ...mg, played } };
+      // Only ship a hand to its owner: the cards left would otherwise reveal the
+      // face-down play by elimination (e.g. "Emperor still in hand → they played
+      // a Citizen"). The opponent/host views never render the other's hand.
+      const hands = {
+        p1: viewerKey === "p1" ? mg.hands.p1 : [],
+        p2: viewerKey === "p2" ? mg.hands.p2 : [],
+      };
+      return { ...state, minigame: { ...mg, played, hands } };
     }
 
     if (mg.id === "tower") {
@@ -403,10 +410,15 @@ export class GameRoom implements DurableObject {
     }
     if (await this.state.storage.get<boolean>("starting")) return;
     await this.state.storage.put("starting", true);
-    void this.clearAlarm();
-    this.data.state.settings = mergeSettings(settings);
-    await this.beginNextMinigame();
-    await this.state.storage.delete("starting");
+    try {
+      void this.clearAlarm();
+      this.data.state.settings = mergeSettings(settings);
+      await this.beginNextMinigame();
+    } finally {
+      // Always release the lock, even if beginNextMinigame throws — otherwise
+      // the room could never be started again.
+      await this.state.storage.delete("starting");
+    }
   }
 
   private async beginNextMinigame() {
@@ -421,12 +433,23 @@ export class GameRoom implements DurableObject {
     this.snapshotScores();
     this.commit({ phase: "minigame-intro" });
     this.broadcast();
+    // The intro waits for the host to advance, so no live timer owns the alarm
+    // slot here. If everyone has already left, arm idle-cleanup now — otherwise
+    // the room would sit orphaned (no further webSocketClose will fire).
+    if (this.connectedPlayers().length === 0) await this.maybeScheduleIdleCleanup();
   }
 
   private async startActiveMinigame() {
     const id = this.data.state.currentMinigame;
     if (!id) return;
-    const slots = slotsFrom(this.connectedPlayers());
+    const players = this.connectedPlayers();
+    if (players.length < 2) {
+      // A player dropped during the intro — don't build slots from a short list
+      // (slotsFrom would throw). Stay parked so the host can retry on rejoin.
+      this.broadcastError("Need 2 players to continue");
+      return;
+    }
+    const slots = slotsFrom(players);
     let state: MinigameState;
     switch (id) {
       case "trivia": {

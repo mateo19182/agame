@@ -606,6 +606,8 @@ export function defaultSettings(): GameSettings {
 }
 
 export const MAX_MATCH_LENGTH = 20;
+export const MAX_TRIVIA_QUESTIONS = 20;
+export const MAX_MEMORY_LANE_PHOTOS = 50;
 
 /**
  * Merge a (possibly partial / untrusted) settings object onto the defaults.
@@ -619,11 +621,26 @@ export function mergeSettings(partial: Partial<GameSettings> | undefined): GameS
   const enabled = Array.isArray(partial.enabledMinigames)
     ? ALL_MINIGAME_IDS.filter((id) => partial.enabledMinigames!.includes(id))
     : base.enabledMinigames;
+  const minigames = {
+    ...base.minigames,
+    ...(partial.minigames ?? {}),
+  } as MinigameConfigMap;
+  // Clamp untrusted per-game config the same way on both sides: a crafted
+  // start-game message must not be able to request an oversized trivia fetch
+  // or push an unbounded photo array into Durable Object state.
+  const qc = Math.floor(minigames.trivia.questionCount);
+  minigames.trivia = {
+    ...minigames.trivia,
+    questionCount: Number.isFinite(qc) ? Math.max(1, Math.min(MAX_TRIVIA_QUESTIONS, qc)) : base.minigames.trivia.questionCount,
+  };
+  minigames["memory-lane"] = {
+    ...minigames["memory-lane"],
+    photos: Array.isArray(minigames["memory-lane"].photos)
+      ? minigames["memory-lane"].photos.slice(0, MAX_MEMORY_LANE_PHOTOS)
+      : [],
+  };
   return {
-    minigames: {
-      ...base.minigames,
-      ...(partial.minigames ?? {}),
-    } as MinigameConfigMap,
+    minigames,
     enabledMinigames: enabled.length > 0 ? enabled : base.enabledMinigames,
     matchLength:
       typeof partial.matchLength === "number" && partial.matchLength > 0
