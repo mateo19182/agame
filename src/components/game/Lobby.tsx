@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { Link } from "react-router-dom";
+import { QRCodeSVG } from "qrcode.react";
 import type { GameState, MinigameId } from "@shared/game";
 import { MAX_MATCH_LENGTH, MINIGAME_META, memoryLaneHasContent } from "@shared/game";
 import { loadSettings } from "@/lib/settings";
@@ -31,6 +32,12 @@ export function Lobby({
       <div className="glass rounded-3xl px-6 py-8 max-w-md w-full">
         <div className="text-sm text-[color:var(--muted)]">Room code</div>
         <div className="mt-2 text-6xl sm:text-7xl font-black tracking-[0.2em]">{code}</div>
+        <div className="mt-6 flex justify-center">
+          <div className="rounded-2xl bg-white p-3">
+            <QRCodeSVG value={fullUrl} size={176} level="M" marginSize={0} />
+          </div>
+        </div>
+        <div className="mt-2 text-xs text-[color:var(--muted)]">Scan to join</div>
         <div className="mt-4 flex items-center justify-center gap-2">
           <div className="text-xs text-[color:var(--muted)] break-all max-w-full">{fullUrl}</div>
           <CopyButton value={fullUrl} />
